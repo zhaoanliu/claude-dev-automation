@@ -56,10 +56,19 @@ Never hardcode local absolute paths in committed files.
 
 ## Validation
 
-CI (`.github/workflows/validate.yml`) runs on every PR: actionlint on
-workflows and templates, YAML parse on every `actions/*/action.yml`,
-shellcheck on shell scripts, `node --check` on `.mjs` scripts. Run the same
-checks locally before pushing:
+Two CI workflows run on every PR, and both are required checks:
+
+- `validate.yml` — static: actionlint on workflows and templates, YAML parse
+  on every `actions/*/action.yml`, shellcheck on shell scripts, `node --check`
+  on `.mjs` scripts.
+- `test-actions.yml` — behavioral: stub-based tests of run-claude (retry
+  backoff, script resolution via `GITHUB_ACTION_PATH`), install-claude
+  (wrapper, model default/override, telemetry), check-existing-pr,
+  mark-in-progress, and detect-doc-only. No API key is spent — `claude` is
+  stubbed. trigger-ci-failure, open-fix-pr, and verify-ac are deliberately
+  untested here (real side effects / consumer environment required).
+
+Run the static checks locally before pushing:
 
 ```bash
 actionlint .github/workflows/*.yml

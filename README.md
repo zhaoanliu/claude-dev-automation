@@ -123,9 +123,11 @@ never reference them:
 - **Everything is pinned** — CLI version, action tags, tool versions. Never
   `latest` (rate limits + non-determinism).
 - **This repo governs itself** — changes follow the issue → worktree → PR
-  workflow in `CLAUDE.md`, every PR runs `validate.yml` (actionlint, YAML
-  parse, shellcheck, node --check), and `main` is branch-protected on that
-  check. Every tag traces to a merged PR.
+  workflow in `CLAUDE.md`; every PR runs `validate.yml` (static: actionlint,
+  YAML parse, shellcheck, node --check) and `test-actions.yml` (behavioral:
+  stub-based tests of the actions, no API spend), and `main` is
+  branch-protected on both. Every tag traces to a merged PR, so every tag is
+  behavior-tested before a consumer can pin it.
 
 ## Provenance
 

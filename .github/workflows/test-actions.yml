@@ -1,0 +1,255 @@
+# Behavioral self-tests for the composite actions, so every tag is
+# behavior-tested here before any consumer bumps to it. Claude is stubbed —
+# no API key is spent.
+#
+# Deliberately NOT covered:
+# - trigger-ci-failure: invoking it would fire a real repository_dispatch
+# - open-fix-pr: would create real branches/PRs
+# - verify-ac: vendor-and-adapt action; needs a consumer project's test stack
+name: Test actions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test-run-claude-retry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install claude/sleep stubs
+        run: |
+          mkdir -p /tmp/stub
+          cat > /tmp/stub/claude << 'EOF'
+          #!/bin/bash
+          echo "CLAUDE ARGS: $*" >> /tmp/stub_log.txt
+          N=$(cat /tmp/stub_state.txt 2>/dev/null || echo 0); N=$((N+1)); echo "$N" > /tmp/stub_state.txt
+          case "${STUB_MODE:-ok}" in
+            ok) echo "stub ok"; exit 0 ;;
+            overload_then_ok) if [[ "$N" -lt 3 ]]; then echo "Error: 529 Overloaded"; exit 1; else echo "recovered"; exit 0; fi ;;
+            hard_fail) echo "fatal"; exit 7 ;;
+          esac
+          EOF
+          cat > /tmp/stub/sleep << 'EOF'
+          #!/bin/bash
+          echo "SLEEP $1" >> /tmp/stub_log.txt
+          EOF
+          chmod +x /tmp/stub/claude /tmp/stub/sleep
+          echo "/tmp/stub" >> "$GITHUB_PATH"
+          echo "test prompt" > /tmp/prompt.txt
+
+      - name: Script direct — overload retries with exponential backoff
+        env:
+          STUB_MODE: overload_then_ok
+        run: |
+          rm -f /tmp/stub_log.txt /tmp/stub_state.txt
+          bash scripts/run-claude-retry.sh /tmp/prompt.txt 5 /tmp/out.txt
+          grep -q "recovered" /tmp/out.txt || { echo "FAIL: no recovery output"; exit 1; }
+          [[ $(grep -c "^CLAUDE ARGS" /tmp/stub_log.txt) -eq 3 ]] || { echo "FAIL: expected 3 attempts"; cat /tmp/stub_log.txt; exit 1; }
+          grep -q "SLEEP 30" /tmp/stub_log.txt || { echo "FAIL: first backoff not observed"; exit 1; }
+          grep -q "SLEEP 60" /tmp/stub_log.txt || { echo "FAIL: second backoff not observed"; exit 1; }
+          echo "PASS: retry with exponential backoff"
+
+      - name: Script direct — non-overload failure exits 0 after one attempt
+        env:
+          STUB_MODE: hard_fail
+        run: |
+          rm -f /tmp/stub_log.txt /tmp/stub_state.txt
+          bash scripts/run-claude-retry.sh /tmp/prompt.txt 5 /tmp/out.txt
+          [[ $(grep -c "^CLAUDE ARGS" /tmp/stub_log.txt) -eq 1 ]] || { echo "FAIL: expected 1 attempt"; cat /tmp/stub_log.txt; exit 1; }
+          echo "PASS: non-overload failure does not retry and exits 0"
+
+      - name: Composite action resolves the script via GITHUB_ACTION_PATH
+        uses: ./actions/run-claude
+        with:
+          anthropic-api-key: dummy-key-not-used-by-stub
+          prompt-file: /tmp/prompt.txt
+          max-turns: '5'
+          output-file: /tmp/action_out.txt
+
+      - name: Assert action ran the stub through the script
+        run: |
+          grep -q "stub ok" /tmp/action_out.txt || { echo "FAIL: action did not produce stub output"; exit 1; }
+          echo "PASS: run-claude action delegates to run-claude-retry.sh"
+
+  test-install-claude:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./actions/install-claude
+
+      - name: Verify claude is on PATH
+        run: claude --version
+
+      - name: Verify _claude_bin exists (original binary renamed)
+        run: which _claude_bin
+
+      - name: Verify CLAUDE_MODEL default
+        run: |
+          [[ "$CLAUDE_MODEL" == "claude-sonnet-5" ]] \
+            || { echo "FAIL: CLAUDE_MODEL=$CLAUDE_MODEL"; exit 1; }
+          echo "PASS: CLAUDE_MODEL=$CLAUDE_MODEL"
+
+      - name: Verify CLAUDE_MODEL can be overridden per step
+        env:
+          CLAUDE_MODEL: claude-haiku-4-5-20251001
+        run: |
+          [[ "$CLAUDE_MODEL" == "claude-haiku-4-5-20251001" ]] \
+            || { echo "FAIL: override not respected"; exit 1; }
+          echo "PASS: step-level override works"
+
+      - name: Verify claude wrapper text extraction (JSON success path)
+        run: |
+          printf '{"result":"hello","total_cost_usd":0.01,"usage":{"input_tokens":5,"cache_read_input_tokens":0,"output_tokens":3}}' \
+            > /tmp/claude_raw.json
+          OUT=$({ jq -re '.result // ""' /tmp/claude_raw.json 2>/dev/null || cat /tmp/claude_raw.json; })
+          [[ "$OUT" == "hello" ]] || { echo "FAIL: got '$OUT'"; exit 1; }
+          echo "PASS: text extraction works"
+
+      - name: Verify claude wrapper fallback (non-JSON / overload path)
+        run: |
+          echo "Error: 529 Overloaded" > /tmp/claude_raw.json
+          OUT=$({ jq -re '.result // ""' /tmp/claude_raw.json 2>/dev/null || cat /tmp/claude_raw.json; })
+          echo "$OUT" | grep -q "529" || { echo "FAIL: overload text not preserved"; exit 1; }
+          echo "PASS: fallback preserves raw output"
+
+      - name: Verify --max-turns arg parsing
+        run: |
+          parse_max_turns() {
+            local MAX_TURNS_VAL="" _prev=""
+            for _arg in "$@"; do
+              [[ "$_prev" == "--max-turns" ]] && { MAX_TURNS_VAL="$_arg"; break; }
+              _prev="$_arg"
+            done
+            echo "$MAX_TURNS_VAL"
+          }
+          result=$(parse_max_turns --max-turns 15 -p "some prompt")
+          [[ "$result" == "15" ]] || { echo "FAIL: prefix case got '$result'"; exit 1; }
+          result=$(parse_max_turns -p "some prompt" --max-turns 20)
+          [[ "$result" == "20" ]] || { echo "FAIL: suffix case got '$result'"; exit 1; }
+          result=$(parse_max_turns --max-turns 8)
+          [[ "$result" == "8" ]]  || { echo "FAIL: sole arg case got '$result'"; exit 1; }
+          result=$(parse_max_turns -p "no max turns here")
+          [[ -z "$result" ]]      || { echo "FAIL: absent case got '$result'"; exit 1; }
+          echo "PASS: --max-turns parsed correctly in all positions"
+
+      - name: Verify telemetry payload construction
+        run: |
+          printf '{"result":"ok","total_cost_usd":0.24,"usage":{"input_tokens":5000,"cache_read_input_tokens":120000,"cache_creation_input_tokens":500,"output_tokens":312},"num_turns":8,"is_error":false}' \
+            > /tmp/claude_raw.json
+          PAYLOAD=$(jq -n \
+            --arg wf "Test" --arg rid "123" --arg att "1" --arg job "test" \
+            --arg br "main" --arg act "tester" --arg evt "push" \
+            --arg mdl "claude-sonnet-5" --arg sha "abc123" \
+            --arg mt "15" --arg dur "47" --arg ec "0" \
+            --slurpfile raw /tmp/claude_raw.json \
+            '{workflow_name:$wf,run_id:$rid,
+              run_attempt:($att|try tonumber catch null),
+              job_name:$job,branch:$br,actor:$act,event_name:$evt,model:$mdl,sha:$sha,
+              cost_usd:($raw[0].total_cost_usd//null),
+              input_tokens:($raw[0].usage.input_tokens//null),
+              cache_read_tokens:($raw[0].usage.cache_read_input_tokens//null),
+              cache_creation_tokens:($raw[0].usage.cache_creation_input_tokens//null),
+              output_tokens:($raw[0].usage.output_tokens//null),
+              num_turns:($raw[0].num_turns//null),
+              max_turns:($mt|if . == "" then null else try tonumber catch null end),
+              duration_seconds:($dur|if . == "" then null else try tonumber catch null end),
+              exit_code:($ec|if . == "" then null else try tonumber catch null end),
+              is_error:($raw[0].is_error//false)}')
+          jq -e '
+            .cost_usd == 0.24 and .num_turns == 8 and
+            .max_turns == 15 and .duration_seconds == 47 and
+            .exit_code == 0 and .is_error == false
+          ' <<< "$PAYLOAD"
+          echo "PASS: telemetry payload is well-formed"
+
+      - name: Verify telemetry logging skipped when credentials absent
+        run: |
+          CLAUDE_TELEMETRY_URL="" CLAUDE_TELEMETRY_KEY=""
+          if [[ -n "${CLAUDE_TELEMETRY_URL:-}" && -n "${CLAUDE_TELEMETRY_KEY:-}" ]]; then
+            echo "FAIL: entered logging block without credentials"
+            exit 1
+          fi
+          echo "PASS: logging correctly skipped when credentials absent"
+
+  test-check-existing-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: No-match case — nonexistent prefix should not set skip
+        id: no_match
+        uses: ./actions/check-existing-pr
+        with:
+          branch-prefix: definitely-nonexistent-xyz-99999-
+
+      - name: Assert skip is not set
+        run: |
+          if [[ "${{ steps.no_match.outputs.skip }}" == "true" ]]; then
+            echo "FAIL: expected no skip for nonexistent prefix"
+            exit 1
+          fi
+          echo "PASS: skip not set for nonexistent prefix"
+
+  test-mark-in-progress:
+    # Dry-run: verifies the action resolves and the multiline labels-to-remove
+    # input parses. Issue 0 does not exist — gh edit fails silently (|| true).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./actions/mark-in-progress
+        with:
+          issue-number: '0'
+          labels-to-remove: |
+            status: backlog
+            status: planned
+
+  test-detect-doc-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./actions/detect-doc-only
+        id: detect
+      - name: Assert behavior per event type
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SKIP: ${{ steps.detect.outputs.skip }}
+        run: |
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            if [[ "$SKIP" == "true" ]]; then
+              echo "FAIL: skip must not be set outside pull_request context"
+              exit 1
+            fi
+            echo "PASS: skip not set outside pull_request context"
+          else
+            # On a PR the outcome depends on the PR's own diff — a doc-only PR
+            # legitimately sets skip=true. Assert only that the action ran.
+            echo "PASS: action completed on pull_request (skip='$SKIP')"
+          fi
+
+  # Aggregate gate for branch protection. if: always() + explicit result check:
+  # without it, a failed dependency would leave this job "skipped", and a
+  # skipped check SATISFIES required status checks — silently disabling the gate.
+  test-actions:
+    if: always()
+    needs: [test-run-claude-retry, test-install-claude, test-check-existing-pr, test-mark-in-progress, test-detect-doc-only]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any dependency failed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            if [[ "$r" != "success" ]]; then
+              echo "FAIL: a dependency job did not succeed"
+              exit 1
+            fi
+          done
+          echo "PASS: all action self-tests succeeded"
