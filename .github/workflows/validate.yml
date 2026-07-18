@@ -1,0 +1,40 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: actionlint on workflows and templates
+        # Templates are linted from a temp copy: in repo context actionlint
+        # follows cd.yml's `uses: ./.github/workflows/<ci>.yml` reusable-workflow
+        # references, which are ADAPT examples that only exist in consumer repos.
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint .github/workflows/*.yml
+          TMP=$(mktemp -d)
+          cp workflow-templates/*.yml "$TMP"/
+          ./actionlint "$TMP"/*.yml
+
+      - name: YAML parse composite actions
+        run: |
+          for f in actions/*/action.yml; do
+            ruby -ryaml -e "YAML.load_file('$f')" || { echo "FAIL: $f"; exit 1; }
+            echo "OK: $f"
+          done
+
+      - name: shellcheck scripts
+        run: shellcheck scripts/*.sh playbook/hooks/*.sh
+
+      - name: node --check mjs scripts
+        run: |
+          for f in scripts/*.mjs; do
+            node --check "$f" || { echo "FAIL: $f"; exit 1; }
+            echo "OK: $f"
+          done

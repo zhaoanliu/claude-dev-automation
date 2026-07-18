@@ -122,6 +122,10 @@ never reference them:
   consistent between sender and receiver when adapting.
 - **Everything is pinned** — CLI version, action tags, tool versions. Never
   `latest` (rate limits + non-determinism).
+- **This repo governs itself** — changes follow the issue → worktree → PR
+  workflow in `CLAUDE.md`, every PR runs `validate.yml` (actionlint, YAML
+  parse, shellcheck, node --check), and `main` is branch-protected on that
+  check. Every tag traces to a merged PR.
 
 ## Provenance
 
