@@ -12,10 +12,12 @@
 # match, closed-issue check, duplicate-PR check) prevent double fixes.
 #
 # Setup:
-#   1. Vendor the composite actions from claude-dev-automation/actions/ into
-#      .github/actions/ in your repo (or, if the library repo is public,
-#      replace `./.github/actions/<name>` with
-#      `zhaoanliu/claude-dev-automation/actions/<name>@v1`).
+#   1. Get the composite actions — recommended: replace each
+#      `./.github/actions/<name>` below with
+#      `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag —
+#      never a floating `@v1` or `@main`). Alternative: vendor them from
+#      claude-dev-automation/actions/ into .github/actions/ (copy scripts/ to
+#      .github/scripts/ alongside).
 #   2. Deploy the webhook bridge (integrations/sentry-webhook/route.ts) in your
 #      app and configure Sentry — see integrations/sentry-webhook/SETUP.md.
 #   3. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope),

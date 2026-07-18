@@ -5,8 +5,11 @@
 # verify-ac are pushed back to the PR branch.
 #
 # Setup:
-#   1. Vendor the composite actions from claude-dev-automation/actions/ into
-#      .github/actions/ in your repo: install-claude, verify-ac.
+#   1. Get the composite actions. install-claude — recommended: replace
+#      `./.github/actions/install-claude` with
+#      `zhaoanliu/claude-dev-automation/actions/install-claude@v1.1.0` (exact
+#      tag). verify-ac must be VENDORED and adapted (see the
+#      feature-implement.yml header): copy it into .github/actions/verify-ac.
 #   2. Vendor claude-dev-automation/scripts/run-claude-retry.sh into
 #      .github/scripts/run-claude-retry.sh (verify-ac calls it there).
 #   3. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope — used for

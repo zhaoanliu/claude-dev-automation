@@ -155,8 +155,13 @@ The job needs `permissions: issues: write` (it checks off passing AC items in
 
 1. Copy `feature-design.yml`, `feature-implement.yml`, `feature-verify.yml`
    into `.github/workflows/`.
-2. Vendor composite actions into `.github/actions/`: `install-claude`,
-   `run-claude`, `check-existing-pr`, `mark-in-progress`, `verify-ac`.
+2. Get the composite actions. `install-claude`, `run-claude`,
+   `check-existing-pr`, `mark-in-progress` — recommended: replace each
+   `./.github/actions/<name>` reference with
+   `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag);
+   alternative: vendor into `.github/actions/`. `verify-ac` must be
+   **vendored and adapted** regardless — it encodes your project's test
+   environment (helpers contract, base URL, validation commands).
 3. Vendor `scripts/run-claude-retry.sh` into
    `.github/scripts/run-claude-retry.sh` (keep it executable) — the
    `run_claude()` wrappers in feature-implement.yml and verify-ac call it there.

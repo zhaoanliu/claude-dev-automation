@@ -31,6 +31,10 @@ Never hardcode local absolute paths in committed files.
 - Release procedure: merge to `main` → `git tag -a vX.Y.Z -m "..."` → push
   tag → `gh release create vX.Y.Z` with notes stating whether it is a drop-in
   upgrade. Every tag must trace to a merged PR and its issue.
+- **When cutting a tag, update the current-tag references in docs** — grep
+  for the previous tag (`grep -rn 'v1\.1\.0' --include='*.md' --include='*.yml' .`)
+  and bump README, template headers, SETUP.md, and FEATURE-PIPELINE.md in the
+  release PR itself.
 - Consumers upgrade deliberately: bump the pin in *their* repo (grep for
   `claude-dev-automation/actions`), verify their CI, merge.
 

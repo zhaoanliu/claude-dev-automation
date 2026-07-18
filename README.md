@@ -12,7 +12,8 @@ This repo is shared by multiple projects and is **consumed by exact semver
 tag** — never by branch, never `@main`, never a floating major tag.
 
 - Consumers reference actions as
-  `uses: zhaoanliu/claude-dev-automation/actions/<name>@v1.0.0`.
+  `uses: zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (the current
+  tag — see Releases).
 - Published tags are immutable — never moved or deleted. Fixes ship as a new
   tag (`v1.0.1`); breaking interface changes (renamed inputs, changed file
   contracts, changed dispatch event names) bump the major (`v2.0.0`).
@@ -72,7 +73,7 @@ playbook/            # process knowledge — copy and adapt
 ## Adopting in a new repo
 
 1. **Reference the actions by pinned tag** (recommended):
-   `uses: zhaoanliu/claude-dev-automation/actions/<name>@v1.0.0`.
+   `uses: zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0`.
    Vendoring into `.github/actions/` also works (copy `scripts/` to
    `.github/scripts/` alongside — `run-claude` and `verify-ac` resolve the
    retry script relatively and work in both layouts).
