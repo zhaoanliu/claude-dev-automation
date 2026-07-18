@@ -23,9 +23,11 @@ tag** — never by branch, never `@main`, never a floating major tag.
   version by copy, not by tag — a consumer's copied workflow keeps working
   regardless of what happens here. Only the `actions/` (and the scripts they
   delegate to, which travel with the tag) are consumed live.
-- The repo is private; other repos owned by the same user can still use its
-  actions because the Actions access policy is set to `user`
-  (`gh api -X PUT repos/zhaoanliu/claude-dev-automation/actions/permissions/access -f access_level=user`).
+- The repo is **public** — required because consumers include public repos
+  (job-tracker), and GitHub only lets *private* same-owner repos use actions
+  from a private repo. Everything here was extracted from the already-public
+  job-tracker repo, so nothing new is exposed. Never commit secrets or
+  project-internal details here.
 
 ## Layout
 
