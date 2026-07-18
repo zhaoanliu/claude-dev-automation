@@ -6,11 +6,13 @@
 # run feature-implement.yml (Phase 2).
 #
 # Setup:
-#   1. Vendor the composite actions from claude-dev-automation/actions/ into
-#      .github/actions/ in your repo: install-claude, run-claude.
-#      (run-claude delegates to run-claude-retry.sh — vendor
+#   1. Get the composite actions (install-claude, run-claude) — recommended:
+#      replace each `./.github/actions/<name>` below with
+#      `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag; the
+#      pinned run-claude brings its own copy of run-claude-retry.sh).
+#      Alternative: vendor them into .github/actions/ AND vendor
 #      claude-dev-automation/scripts/run-claude-retry.sh into
-#      .github/scripts/run-claude-retry.sh as well.)
+#      .github/scripts/run-claude-retry.sh.
 #   2. Secrets: ANTHROPIC_API_KEY (GITHUB_TOKEN is built in).
 #   3. Labels used: `status: approved`, `status: design-review`,
 #      `implementation`, `user review required`.

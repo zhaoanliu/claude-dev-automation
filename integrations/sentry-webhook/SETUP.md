@@ -15,9 +15,11 @@ End-to-end flow:
 
 - Copy `route.ts` to `app/api/sentry-webhook/route.ts` in your Next.js app.
 - Copy `workflow-templates/sentry-auto-fix.yml` to `.github/workflows/` and
-  vendor the composite actions from `actions/` into `.github/actions/`
-  (`install-claude`, `run-claude`, `check-existing-pr`, `mark-in-progress`,
-  `open-fix-pr`).
+  get the composite actions (`install-claude`, `run-claude`,
+  `check-existing-pr`, `mark-in-progress`, `open-fix-pr`) — recommended:
+  replace each `./.github/actions/<name>` reference with
+  `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag);
+  alternative: vendor them from `actions/` into `.github/actions/`.
 - Adjust the `# ADAPT:` markers in the workflow (dependency install, local CI
   commands, project-specific prompt constraints).
 

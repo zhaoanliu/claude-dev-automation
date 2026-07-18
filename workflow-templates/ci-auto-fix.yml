@@ -6,9 +6,13 @@
 # high-risk → human review).
 #
 # Setup:
-#   1. Vendor the composite actions from claude-dev-automation/actions/ into
-#      .github/actions/ in your repo: install-claude, run-claude,
-#      check-existing-pr, mark-in-progress, open-fix-pr, trigger-ci-failure.
+#   1. Get the composite actions (install-claude, run-claude,
+#      check-existing-pr, mark-in-progress, open-fix-pr, trigger-ci-failure) —
+#      recommended: replace each `./.github/actions/<name>` reference (here
+#      AND in the trigger snippet in step 3) with
+#      `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag).
+#      Alternative: vendor them into .github/actions/ (copy scripts/ to
+#      .github/scripts/ alongside).
 #   2. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope). GH_PAT is
 #      load-bearing for push attribution — see the checkout step comment.
 #   3. Feed CI failures into this workflow: add trigger-ci-failure as the

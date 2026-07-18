@@ -3,7 +3,8 @@
 # rule (no judgment calls); unresolvable PRs get a `merge conflict` label and a
 # comment instead.
 #
-# Setup: vendor the composite actions (see bug-fix.yml header note).
+# Setup: get the composite actions by pinned tag or vendoring (see the
+# bug-fix.yml header note).
 # Secrets: ANTHROPIC_API_KEY, GH_PAT (checkout token MUST be GH_PAT — pushes made
 # with GITHUB_TOKEN suppress the pull_request CI triggers on the rebased PRs).
 name: Rebase conflicting PRs

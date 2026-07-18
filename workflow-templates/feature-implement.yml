@@ -7,9 +7,13 @@
 # finally a PR that closes both #X and #Y.
 #
 # Setup:
-#   1. Vendor the composite actions from claude-dev-automation/actions/ into
-#      .github/actions/ in your repo: install-claude, check-existing-pr,
-#      mark-in-progress, verify-ac.
+#   1. Get the composite actions. install-claude, check-existing-pr, and
+#      mark-in-progress — recommended: replace `./.github/actions/<name>` with
+#      `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag).
+#      verify-ac must be VENDORED and adapted regardless: copy
+#      claude-dev-automation/actions/verify-ac into .github/actions/verify-ac
+#      and edit its ADAPT sections — it encodes your project's test
+#      environment (helpers contract, base URL, validation commands).
 #   2. Vendor claude-dev-automation/scripts/run-claude-retry.sh into
 #      .github/scripts/run-claude-retry.sh — the run_claude() wrapper below and
 #      the verify-ac action both call it at that path. (A composite action
