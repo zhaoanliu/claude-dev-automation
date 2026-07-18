@@ -40,6 +40,7 @@ actions/             # composite actions — consume via pinned tag, or vendor i
   mark-in-progress/  # label state transition helper
   detect-doc-only/   # doc-only PR short-circuit (job-level, required-check-safe)
   trigger-ci-failure/# repository_dispatch on CI failure (feeds ci-auto-fix)
+  supabase-start/    # STACK MODULE (Supabase): supabase start with retries on transient failures
   verify-ac/         # generate + run acceptance-criteria E2E tests, self-heal on failure
 scripts/
   run-claude-retry.sh    # canonical 529/overload retry loop (vendor to .github/scripts/)
@@ -92,6 +93,17 @@ playbook/            # process knowledge — copy and adapt
 6. **Playbook**: start your `CLAUDE.md` from `playbook/CLAUDE-starter.md`,
    copy `playbook/commands/` into `.claude/commands/`, and wire the
    session-start hook via `playbook/settings.json` → `.claude/settings.json`.
+
+## Stack modules
+
+The core actions and templates are stack-agnostic. Per-stack assets live in
+the same menu, clearly labeled — projects that don't use the stack simply
+never reference them:
+
+- **Supabase**: `actions/supabase-start`, `workflow-templates/db-fix.yml`,
+  `install-claude`'s optional PostgREST telemetry sink
+- **Vercel**: `workflow-templates/cd*.yml`
+- **Sentry**: `workflow-templates/sentry-auto-fix.yml`, `integrations/sentry-webhook/`
 
 ## Design notes
 
