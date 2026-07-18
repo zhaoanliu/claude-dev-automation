@@ -1,0 +1,388 @@
+# CI self-healing: when a CI workflow fails, this workflow checks out the
+# failing branch, feeds the failed-step logs to Claude, verifies the fix
+# against local CI, then either pushes the fix directly to the failing PR
+# branch (so CI re-runs on the same PR) or — for failures on main — opens a
+# risk-gated fix PR via open-fix-pr (low-risk → auto-merge once CI passes;
+# high-risk → human review).
+#
+# Setup:
+#   1. Vendor the composite actions from claude-dev-automation/actions/ into
+#      .github/actions/ in your repo: install-claude, run-claude,
+#      check-existing-pr, mark-in-progress, open-fix-pr, trigger-ci-failure.
+#   2. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope). GH_PAT is
+#      load-bearing for push attribution — see the checkout step comment.
+#   3. Feed CI failures into this workflow: add trigger-ci-failure as the
+#      LAST step of every CI workflow you want self-healed:
+#
+#        - name: Trigger CI auto-fix on failure
+#          if: failure() && github.actor != 'github-actions[bot]'
+#          uses: ./.github/actions/trigger-ci-failure
+#          with:
+#            gh-pat: ${{ secrets.GH_PAT }}
+#
+#      The actor guard is infinite-loop layer 1: a CI run caused by a bot
+#      push never re-dispatches. Skip the step for infra-only workflows
+#      (deploy-only, release tagging, dependency updates).
+#   4. Adapt every `# ADAPT:` marker below (validation commands, source file
+#      extensions) to your stack — npm commands are shown as examples.
+#
+# Live test for push attribution — run after ANY change to this file; the
+# failure mode is silent (fix commit pushed, PR checks stuck at "Waiting for
+# status to be reported", no new CI run starts):
+#   1. Create a branch with an ADDITIVE trivially-fixable failure — add a
+#      new failing test (e.g. expect(true).toBe(false)); never flip an
+#      existing value back and forth, because a net-zero diff vs main can
+#      skip CI entirely and let auto-merge fire unintentionally.
+#   2. Open the PR as a DRAFT (drafts are ineligible for auto-merge). Note:
+#      trigger-ci-failure skips drafts, so briefly `gh pr ready <N>` to let
+#      the failing run dispatch, then convert back to draft.
+#   3. Watch: gh run list --workflow=ci-auto-fix.yml --limit 3
+#   4. After this workflow pushes its fix commit, run `gh pr checks <N>` —
+#      PASS: new check runs with timestamps after the push. FAIL: empty
+#      statusCheckRollup or stale timestamps — the push is still attributed
+#      to github-actions[bot] and CI triggers are being suppressed.
+#   5. Close and delete the draft PR without merging.
+name: Auto-fix CI failures
+
+on:
+  repository_dispatch:
+    types: [ci-failure]
+
+jobs:
+  auto-fix-ci:
+    # Infinite-loop layer 2: never react to a dispatch attributed to the bot
+    # itself (layer 1 is the actor guard on the trigger-ci-failure step, and
+    # GitHub additionally suppresses CI triggers for GITHUB_TOKEN pushes).
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    concurrency:
+      # Per-branch group: simultaneous failures on the same branch queue
+      # rather than race; failures on different branches heal in parallel.
+      group: ci-auto-fix-${{ github.event.client_payload.head_branch }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+
+    steps:
+      # `token: GH_PAT` is load-bearing, NOT a convenience. actions/checkout
+      # persists its token as an http.extraheader in git config, and that
+      # header wins over any URL-embedded credentials (`git remote set-url`
+      # alone does NOT fix this). With the default GITHUB_TOKEN, the fix
+      # push to a PR branch is attributed to github-actions[bot] and GitHub
+      # silently suppresses the `pull_request: [synchronize]` trigger — the
+      # PR's checks reset to "Waiting for status to be reported" and no CI
+      # ever runs. Persisting GH_PAT (a human actor) from checkout onward
+      # makes the push re-trigger CI normally.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.client_payload.head_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - uses: ./.github/actions/install-claude
+
+      - name: Get failure logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.client_payload.run_id }}
+        run: |
+          gh run view "$RUN_ID" --log-failed 2>&1 | head -500 > /tmp/ci_logs.txt
+
+      - name: Get branch diff vs main
+        env:
+          HEAD_BRANCH: ${{ github.event.client_payload.head_branch }}
+        run: |
+          if [[ "$HEAD_BRANCH" != "main" ]]; then
+            git fetch origin main
+            # ADAPT: your source extensions
+            { git diff --stat origin/main..HEAD; echo ""; git diff origin/main..HEAD -- '*.ts' '*.tsx' '*.js' '*.json'; } | head -400 > /tmp/branch_diff.txt
+          else
+            touch /tmp/branch_diff.txt
+          fi
+
+      - name: Find or create GitHub issue
+        id: issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_NAME: ${{ github.event.client_payload.workflow_name }}
+          HEAD_BRANCH: ${{ github.event.client_payload.head_branch }}
+          RUN_URL: ${{ github.event.client_payload.run_url }}
+        run: |
+          TITLE="CI failure: ${WORKFLOW_NAME} on ${HEAD_BRANCH}"
+          printf '%s' "$TITLE" > /tmp/issue_title.txt
+          EXISTING=$(gh issue list \
+            --state open \
+            --limit 50 \
+            --json number,title | \
+            jq --arg title "$TITLE" \
+              '[.[] | select(.title == $title)] | .[0] // empty')
+          if [[ -n "$EXISTING" ]]; then
+            NUMBER=$(echo "$EXISTING" | jq -r '.number')
+          else
+            # Also check recently-closed issues — reopen rather than create a
+            # duplicate, so recurrent failures on the same branch/workflow
+            # are handled rather than silently skipped.
+            CLOSED=$(gh issue list \
+              --state closed \
+              --limit 20 \
+              --json number,title | \
+              jq --arg title "$TITLE" \
+                '[.[] | select(.title == $title)] | .[0] // empty')
+            if [[ -n "$CLOSED" ]]; then
+              NUMBER=$(echo "$CLOSED" | jq -r '.number')
+              gh issue reopen "${NUMBER}" || true
+              echo "number=${NUMBER}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            ISSUE_URL=$(gh issue create \
+              --title "$TITLE" \
+              --body "**Workflow:** ${WORKFLOW_NAME}"$'\n\n'"**Branch:** \`${HEAD_BRANCH}\`"$'\n\n'"**Run:** ${RUN_URL}"$'\n\n'"This issue was automatically created from a CI failure.")
+            NUMBER=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$')
+          fi
+          echo "number=${NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Write prompt
+        if: steps.issue.outputs.skip != 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          WORKFLOW_NAME: ${{ github.event.client_payload.workflow_name }}
+          HEAD_BRANCH: ${{ github.event.client_payload.head_branch }}
+        run: |
+          {
+            echo "A CI workflow failed and needs to be fixed."
+            echo ""
+            echo "Workflow: ${WORKFLOW_NAME}"
+            echo "Branch: ${HEAD_BRANCH}"
+            echo "Issue: #${ISSUE_NUMBER}"
+            echo ""
+            echo "## Failed step logs"
+            echo ""
+            cat /tmp/ci_logs.txt
+            echo ""
+          } > /tmp/prompt.txt
+          if [[ -s /tmp/branch_diff.txt ]]; then
+            { echo "## Changes on this branch vs main"; echo ""; cat /tmp/branch_diff.txt; echo ""; } >> /tmp/prompt.txt
+          fi
+          # File contract consumed downstream: /tmp/issue_title.txt (written
+          # above), /tmp/summary.txt and /tmp/risk.txt (written by Claude) —
+          # open-fix-pr reads all three on the main-branch path.
+          cat >> /tmp/prompt.txt << 'EOF'
+          Analyze the CI failure above. Find the root cause in the codebase and fix it.
+          Do NOT run any git commands — just edit the files.
+          Do NOT add code comments explaining what you changed.
+
+          After making the fix, write two output files:
+
+          1. /tmp/summary.txt — a markdown summary with exactly these sections:
+          ## Problem
+          One or two sentences: what the CI failure was and what caused it.
+          ## Root cause
+          One sentence: where in the code the issue lives.
+          ## Fix
+          Bullet list — one line per file changed, explaining what was changed and why.
+
+          2. /tmp/risk.txt — a single word: low or high.
+          Write "low" if ALL of the following are true:
+            - 1 or 2 files changed
+            - The fix is a null guard, type safety fix, lint error, type error, or simple value correction
+            - No new functions, classes, or logic flows were added
+            - No auth, database schema, or API surface was touched
+          Write "high" for anything else; when in doubt use "high"
+
+          Write ONLY the word "low" or "high" to /tmp/risk.txt, nothing else.
+          EOF
+
+      - uses: ./.github/actions/check-existing-pr
+        if: steps.issue.outputs.skip != 'true'
+        id: pr_check
+        with:
+          branch-prefix: fix/ci-issue-${{ steps.issue.outputs.number }}-
+
+      - uses: ./.github/actions/mark-in-progress
+        if: steps.issue.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+
+      - name: Run Claude Code
+        if: steps.issue.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        uses: ./.github/actions/run-claude
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Verify fix with local CI
+        if: steps.issue.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # ADAPT: install dependencies for your stack
+          npm ci
+
+          # ADAPT: run_ci must mirror your CI's required checks exactly. Each
+          # check writes its full output to /tmp/<name>_out.txt and flips its
+          # *_OK flag on failure. npm commands shown as examples.
+          run_ci() {
+            LINT_OK=true; TYPECHECK_OK=true; TEST_OK=true
+            npm run lint > /tmp/lint_out.txt 2>&1 || LINT_OK=false
+            npx tsc --noEmit > /tmp/typecheck_out.txt 2>&1 || TYPECHECK_OK=false
+            npm test > /tmp/test_out.txt 2>&1 || TEST_OK=false
+            [[ "$LINT_OK" == true && "$TYPECHECK_OK" == true && "$TEST_OK" == true ]]
+          }
+
+          if run_ci; then
+            echo "CI_PASS=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "Local CI failed — running one fix attempt"
+          : > /tmp/ci_failures.txt
+          if [[ "$LINT_OK" != true ]]; then
+            { echo "=== lint ==="; tail -30 /tmp/lint_out.txt; echo ""; } >> /tmp/ci_failures.txt
+          fi
+          if [[ "$TYPECHECK_OK" != true ]]; then
+            { echo "=== typecheck ==="; tail -30 /tmp/typecheck_out.txt; echo ""; } >> /tmp/ci_failures.txt
+          fi
+          if [[ "$TEST_OK" != true ]]; then
+            { echo "=== tests ==="; tail -50 /tmp/test_out.txt; echo ""; } >> /tmp/ci_failures.txt
+          fi
+
+          GIT_DIFF=$(git diff HEAD 2>/dev/null | head -c 20000)
+          NEW_FILES=$({ git diff --name-only; git ls-files --others --exclude-standard; } 2>/dev/null)
+          {
+            echo "Your fix attempt failed local CI. Fix the remaining failures."
+            echo ""
+            if [[ -n "$NEW_FILES" ]]; then
+              echo "=== New/modified files ==="
+              echo "$NEW_FILES"
+              echo ""
+            fi
+            if [[ -n "$GIT_DIFF" ]]; then
+              echo "=== Changes so far ==="
+              echo "$GIT_DIFF"
+              echo ""
+            fi
+            echo "=== CI failures to fix ==="
+            cat /tmp/ci_failures.txt
+            # ADAPT: same commands as run_ci above
+            echo "Validate: npm run lint && npx tsc --noEmit && npm test"
+          } > /tmp/fix_prompt.txt
+
+          DELAY=30
+          for fix_attempt in 1 2; do
+            set +eo pipefail
+            claude --max-turns 15 \
+              -p "$(cat /tmp/fix_prompt.txt)" 2>&1 | tee /tmp/fix_output.txt
+            set -eo pipefail
+            if grep -q "529\|Overloaded\|at capacity" /tmp/fix_output.txt && [[ $fix_attempt -lt 2 ]]; then
+              sleep $DELAY
+              DELAY=$((DELAY * 2))
+              continue
+            fi
+            if run_ci; then
+              echo "CI_PASS=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+
+          echo "CI_PASS=false" >> "$GITHUB_ENV"
+          echo "Local CI still failing after fix attempts — will open draft PR"
+
+      - name: Apply fix to PR branch or flag for main-branch PR
+        id: fix
+        if: steps.issue.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          HEAD_BRANCH: ${{ github.event.client_payload.head_branch }}
+        run: |
+          if [[ -z "$(git diff --name-only)" ]]; then
+            # A concurrent run for the same branch may have already pushed a fix.
+            # Check the latest commit on origin — if it's an auto-fix commit, close
+            # this issue automatically instead of escalating to manual investigation.
+            git fetch origin "${HEAD_BRANCH}" 2>/dev/null || true
+            LATEST_MSG=$(git log -1 --pretty=%s "origin/${HEAD_BRANCH}" 2>/dev/null || echo "")
+            if [[ "$LATEST_MSG" == *"auto-fix CI failure"* ]]; then
+              gh issue comment "${ISSUE_NUMBER}" \
+                --body "CI failure on \`${HEAD_BRANCH}\` was already resolved by a concurrent auto-fix run. Closing automatically."
+              GH_TOKEN="${GH_PAT}" gh issue edit "${ISSUE_NUMBER}" \
+                --remove-label "status: in progress" || true
+              GH_TOKEN="${GH_PAT}" gh issue close "${ISSUE_NUMBER}"
+            else
+              gh issue comment "${ISSUE_NUMBER}" \
+                --body "Claude analyzed the CI failure but made no code changes."
+              GH_TOKEN="${GH_PAT}" gh issue edit "${ISSUE_NUMBER}" \
+                --remove-label "status: in progress" \
+                --add-label "manual investigation required" || true
+            fi
+            exit 0
+          fi
+          FILES_CHANGED=$(git diff --name-only | wc -l | tr -d ' ')
+          STATS=$(git diff --shortstat)
+          INSERTIONS=$(echo "$STATS" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
+          DELETIONS=$(echo "$STATS" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
+          TOTAL_LINES=$(( ${INSERTIONS:-0} + ${DELETIONS:-0} ))
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [[ "$HEAD_BRANCH" != "main" ]]; then
+            # CI failed on a PR branch
+            if [[ "${CI_PASS}" != "true" ]]; then
+              # Bot couldn't fix it — don't push broken code; flag for human
+              gh issue comment "${ISSUE_NUMBER}" \
+                --body "Claude attempted a fix but local CI still fails after multiple attempts. Manual investigation required on \`${HEAD_BRANCH}\`."
+              GH_TOKEN="${GH_PAT}" gh issue edit "${ISSUE_NUMBER}" \
+                --remove-label "status: in progress" \
+                --add-label "manual investigation required" || true
+              exit 0
+            fi
+            # CI passes — push fix directly so CI re-runs on the same branch.
+            # The branch may have moved while Claude worked (concurrent runs,
+            # human pushes) — rebase onto the current tip; on conflict, abort
+            # and escalate rather than force anything.
+            git add -A
+            git commit -m "fix: auto-fix CI failure for issue #${ISSUE_NUMBER}"
+            git fetch origin "${HEAD_BRANCH}"
+            if ! git rebase "origin/${HEAD_BRANCH}"; then
+              git rebase --abort
+              gh issue comment "${ISSUE_NUMBER}" \
+                --body "Auto-fix failed: rebase conflict when applying fix on top of recent changes to \`${HEAD_BRANCH}\`. Manual investigation required."
+              exit 0
+            fi
+            # If the rebase leaves us 0 commits ahead, a concurrent run
+            # already pushed the identical fix — skip the push.
+            COMMITS_AHEAD=$(git rev-list "origin/${HEAD_BRANCH}..HEAD" --count)
+            if [[ "$COMMITS_AHEAD" -gt 0 ]]; then
+              # Belt-and-braces: checkout already persisted GH_PAT (which is
+              # what actually wins — see the checkout comment), but keep the
+              # push URL on GH_PAT too so no code path pushes as the bot.
+              git remote set-url origin "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+              git push origin "HEAD:${HEAD_BRANCH}"
+            else
+              echo "Fix already applied by another run, skipping push"
+            fi
+            {
+              if [[ -s /tmp/summary.txt ]]; then
+                cat /tmp/summary.txt
+                echo ""
+              fi
+              echo "Fix pushed to \`${HEAD_BRANCH}\` (${FILES_CHANGED} file(s), ${TOTAL_LINES} lines changed). Closes #${ISSUE_NUMBER}"
+            } > /tmp/issue_comment.txt
+            gh issue comment "${ISSUE_NUMBER}" --body-file /tmp/issue_comment.txt
+            GH_TOKEN="${GH_PAT}" gh issue edit "${ISSUE_NUMBER}" --remove-label "status: in progress" || true
+            GH_TOKEN="${GH_PAT}" gh issue close "${ISSUE_NUMBER}"
+          else
+            # CI failed on main — open a PR (handled by the next step)
+            echo "open_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open fix PR (main-branch CI failure)
+        if: steps.fix.outputs.open_pr == 'true'
+        uses: ./.github/actions/open-fix-pr
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+          gh-pat: ${{ secrets.GH_PAT }}
+          branch-prefix: 'fix/ci-issue-'
+          commit-message: 'fix: auto-fix CI failure for issue'
+          ci-passed: ${{ env.CI_PASS }}

@@ -1,0 +1,231 @@
+# Verify acceptance criteria — composite action for the feature pipeline.
+#
+# Contract (set as environment variables by the calling workflow before this
+# action runs — feature-implement.yml and feature-verify.yml both do this):
+#   DESIGN_NUMBER — design issue number containing "## Acceptance criteria"
+#   DESIGN_BODY   — full body of that design issue
+# Writes AC_PASS to $GITHUB_ENV: "true" | "false" | "skipped".
+#
+# Vendoring: copy this action to .github/actions/verify-ac/ in your repo AND
+# copy claude-dev-automation/scripts/run-claude-retry.sh to
+# .github/scripts/run-claude-retry.sh — the run_claude() wrapper below resolves
+# it via $GITHUB_ACTION_PATH/../../scripts/run-claude-retry.sh.
+#
+# `# ADAPT:` marks project-specific pieces: the optional local backing stack,
+# the Playwright test-generation rules (helper imports, baseURL, dev-server
+# command), and the post-self-heal validation commands.
+name: Verify acceptance criteria
+description: >
+  Generate Playwright tests from the design issue's acceptance criteria,
+  run them against a locally running app, and self-heal the
+  implementation if any test fails (max 2 attempts). Writes AC_PASS to
+  $GITHUB_ENV: "true" | "false" | "skipped".
+
+inputs:
+  github_token:
+    description: GitHub token for editing the design issue checkboxes
+    required: true
+  anthropic_api_key:
+    description: Anthropic API key for Claude
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check for acceptance criteria
+      id: ac_check
+      shell: bash
+      run: |
+        if [[ -z "${DESIGN_NUMBER}" ]]; then
+          echo "No design issue linked — skipping AC verification"
+          echo "AC_PASS=skipped" >> "$GITHUB_ENV"
+          echo "has_ac=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        printf '%s' "${DESIGN_BODY}" > /tmp/design_for_ac.txt
+        AC_TEXT=$(python3 -c "import re; b=open('/tmp/design_for_ac.txt').read(); m=re.search(r'## Acceptance criteria\n(.*?)(?=\n## |\Z)', b, re.DOTALL); print(m.group(1).strip() if m else '')" 2>/dev/null || true)
+
+        if [[ -z "$AC_TEXT" ]]; then
+          echo "No acceptance criteria section found in design issue — skipping AC verification"
+          echo "AC_PASS=skipped" >> "$GITHUB_ENV"
+          echo "has_ac=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "$AC_TEXT" > /tmp/ac_text.txt
+        echo "=== Acceptance criteria to verify ==="
+        cat /tmp/ac_text.txt
+        echo "has_ac=true" >> "$GITHUB_OUTPUT"
+
+    # ── ADAPT/OPTIONAL: local backing stack ──────────────────────────────────
+    # If your app needs a local backend for E2E tests (database, auth, queue,
+    # ...), start it here — gated on has_ac so it only runs when there is
+    # something to verify — and stop it in the final always() step below.
+    # The source project started a local Supabase stack (with its well-known
+    # local demo keys) via a project-specific supabase-start composite action:
+    #
+    # - name: Install Supabase CLI
+    #   if: steps.ac_check.outputs.has_ac == 'true'
+    #   uses: supabase/setup-cli@v2.1.1
+    #   with:
+    #     version: 2.101.0
+    #
+    # - name: Start local Supabase
+    #   if: steps.ac_check.outputs.has_ac == 'true'
+    #   uses: ./.github/actions/supabase-start
+
+    - name: Cache Playwright browsers
+      id: playwright-cache
+      if: steps.ac_check.outputs.has_ac == 'true'
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/ms-playwright
+        key: playwright-chromium-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+
+    - name: Verify acceptance criteria
+      if: steps.ac_check.outputs.has_ac == 'true'
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        CI: "true"
+        # ADAPT/OPTIONAL: env vars pointing the app at the local backing stack.
+        # The source project used the well-known local Supabase demo keys:
+        # NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:54321
+        # NEXT_PUBLIC_SUPABASE_ANON_KEY: <local demo anon key>
+        # SUPABASE_SERVICE_ROLE_KEY: <local demo service-role key>
+        PLAYWRIGHT_CACHE_HIT: ${{ steps.playwright-cache.outputs.cache-hit }}
+      run: |
+        if [[ "${PLAYWRIGHT_CACHE_HIT}" == "true" ]]; then
+          npx playwright install-deps chromium
+        else
+          npx playwright install --with-deps chromium
+        fi
+
+        run_claude() {
+          bash "$GITHUB_ACTION_PATH/../../scripts/run-claude-retry.sh" "$1" "$2" /tmp/claude_ac_output.txt
+        }
+
+        {
+          echo "Write a Playwright test file to e2e/ac_verify.spec.ts that verifies acceptance criteria for a newly implemented feature."
+          echo ""
+          echo "RULES:"
+          echo "- Import { test, expect } from '@playwright/test'"
+          # ADAPT: the next three rules describe the source project's E2E helper
+          # utilities (e2e/helpers.ts) and its login flow — replace with your
+          # project's test-user setup/teardown helpers and auth flow.
+          echo "- Import { createTestUser, deleteTestUser, loginViaUI } from './helpers'"
+          echo "- Use test.beforeAll to call createTestUser() and store userId; test.afterAll to call deleteTestUser(userId)"
+          echo "- Write exactly one test() block per acceptance criterion, named with the criterion text"
+          echo "- Each test must: call loginViaUI(page), navigate to the relevant page, perform the described action, assert the outcome"
+          # ADAPT: baseURL and dev-server command from your Playwright webServer config
+          echo "- The app baseURL is http://localhost:3000 (Playwright webServer config starts npm run dev automatically)"
+          echo "- Use page.locator(), page.getByRole(), page.getByText() — prefer accessible locators"
+          # ADAPT: point at your E2E helper file
+          echo "- Read e2e/helpers.ts first to understand the available utilities"
+          echo "- Read relevant component and page files to understand actual HTML structure before writing selectors"
+          echo "- Assert on visible text and user-facing behavior — not class names or implementation details"
+          echo ""
+          echo "=== Acceptance criteria ==="
+          cat /tmp/ac_text.txt
+          echo ""
+          echo "After writing e2e/ac_verify.spec.ts, stop. Do NOT run any commands."
+        } > /tmp/ac_gen_prompt.txt
+
+        run_claude /tmp/ac_gen_prompt.txt 20
+
+        if [[ ! -f e2e/ac_verify.spec.ts ]]; then
+          echo "Claude did not generate e2e/ac_verify.spec.ts — skipping AC verification"
+          echo "AC_PASS=skipped" >> "$GITHUB_ENV"
+          exit 0
+        fi
+
+        AC_PASS=false
+        for AC_ATTEMPT in 1 2; do
+          echo "=== AC verification attempt ${AC_ATTEMPT}/2 ==="
+          if npx playwright test e2e/ac_verify.spec.ts --reporter=list > /tmp/ac_results.txt 2>&1; then
+            echo "All acceptance criteria verified on attempt ${AC_ATTEMPT}"
+            AC_PASS=true
+            break
+          fi
+
+          echo "AC verification failed on attempt ${AC_ATTEMPT}:"
+          tail -80 /tmp/ac_results.txt
+
+          if [[ $AC_ATTEMPT -eq 1 ]]; then
+            echo "Running self-heal..."
+            GIT_DIFF=$(git diff HEAD 2>/dev/null | head -c 20000)
+            NEW_FILES=$(git ls-files --others --exclude-standard 2>/dev/null | grep -v 'e2e/ac_verify.spec.ts' || true)
+            STRICT_MODE_FAIL=false
+            grep -q "strict mode violation" /tmp/ac_results.txt && STRICT_MODE_FAIL=true
+            {
+              echo "Acceptance criteria verification failed. Fix the failures so all criteria pass."
+              echo ""
+              if [[ "$STRICT_MODE_FAIL" == "true" ]]; then
+                echo "One or more tests failed with a Playwright strict mode violation (a locator matched"
+                echo "multiple elements). This is a selector ambiguity in the test, not a feature bug."
+                echo "Fix the ambiguous locator(s) in e2e/ac_verify.spec.ts to be more specific."
+                echo "For any other failures in the same run, fix the application code instead."
+              else
+                echo "IMPORTANT: Do NOT modify e2e/ac_verify.spec.ts — it is the ground truth. Only fix application code."
+              fi
+              echo ""
+              echo "=== Failing Playwright output ==="
+              tail -100 /tmp/ac_results.txt
+              echo ""
+              if [[ -n "$NEW_FILES" ]]; then
+                echo "=== New files in implementation ==="
+                echo "$NEW_FILES"
+                echo "(Use Read for full content)"
+                echo ""
+              fi
+              if [[ -n "$GIT_DIFF" ]]; then
+                echo "=== Current implementation diff ==="
+                echo "$GIT_DIFF"
+                echo ""
+              fi
+              echo "=== Acceptance criteria (ground truth) ==="
+              cat /tmp/ac_text.txt
+              echo ""
+              # ADAPT: validation command list in the self-heal prompt — match
+              # your project's lint/typecheck/test commands
+              echo "After fixing, validate: npm run lint && npx tsc --noEmit && npm run test:coverage"
+              echo "Do not run any git commands."
+            } > /tmp/ac_fix_prompt.txt
+
+            run_claude /tmp/ac_fix_prompt.txt 25
+
+            # ADAPT: the same validation commands, run for real (best-effort —
+            # the Playwright re-run above is the actual gate)
+            npm run lint > /tmp/lint_out.txt 2>&1 || true
+            npx tsc --noEmit > /tmp/tsc_out.txt 2>&1 || true
+            npm run test:coverage > /tmp/test_out.txt 2>&1 || true
+
+            git add -A
+            git restore --staged e2e/ac_verify.spec.ts 2>/dev/null || true
+            if ! git diff --cached --quiet; then
+              git commit -m "fix: self-heal from failing acceptance criteria"
+            fi
+          fi
+        done
+
+        echo "AC_PASS=${AC_PASS}" >> "$GITHUB_ENV"
+
+        if [[ "$AC_PASS" == "true" && -n "${DESIGN_NUMBER}" ]]; then
+          gh issue view "${DESIGN_NUMBER}" --json body --jq '.body' > /tmp/design_ac_body.txt
+          python3 -c "import re; b=open('/tmp/design_ac_body.txt').read(); r=re.sub(r'(## Acceptance criteria\n)(.*?)(?=\n## |\Z)', lambda m: m.group(1)+re.sub(r'- \[ \]', '- [x]', m.group(2)), b, flags=re.DOTALL); open('/tmp/design_ac_ticked.txt','w').write(r)" 2>/dev/null || cp /tmp/design_ac_body.txt /tmp/design_ac_ticked.txt
+          gh issue edit "${DESIGN_NUMBER}" --body-file /tmp/design_ac_ticked.txt || true
+        fi
+
+        # The generated spec is never committed — it is regenerated fresh on
+        # every verification run.
+        rm -f e2e/ac_verify.spec.ts
+
+    # ── ADAPT/OPTIONAL: stop the local backing stack ─────────────────────────
+    # Pair with the startup section above. The source project's version:
+    #
+    # - name: Stop local Supabase
+    #   shell: bash
+    #   if: always() && steps.ac_check.outputs.has_ac == 'true'
+    #   run: supabase stop || true

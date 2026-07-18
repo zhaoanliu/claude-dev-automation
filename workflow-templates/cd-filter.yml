@@ -1,0 +1,47 @@
+# Bridges Vercel-side deployment failures into the same self-healing path as
+# CLI deploy failures: when Vercel's GitHub integration reports a failed
+# Production deployment via `deployment_status`, this dispatches the
+# `cd-failure` repository event that cd-auto-fix.yml listens for.
+#
+# The environment filter is also the infinite-loop guard: fix PRs pushed by
+# the auto-fix bot produce Preview deployments, and Preview failures are
+# ignored here — only Production failures re-enter the pipeline.
+#
+# Uses GITHUB_TOKEN (not a PAT): repository_dispatch is one of the two event
+# types GitHub still delivers when caused by GITHUB_TOKEN, so no extra secret
+# is needed. `permissions: contents: write` is required for the dispatch call.
+#
+# Setup:
+#   1. Install cd-auto-fix.yml — it receives the cd-failure dispatch.
+#   2. Connect the Vercel GitHub integration so Vercel creates GitHub
+#      deployments (that is what emits deployment_status events).
+name: CD failure filter
+
+on:
+  deployment_status:
+
+jobs:
+  filter:
+    # ADAPT: 'Production' is the Vercel default environment name — change the
+    # literal if your provider or Vercel project reports a different one
+    # (check with: gh api repos/{owner}/{repo}/deployments --jq '.[].environment')
+    if: github.event.deployment_status.state == 'failure' && github.event.deployment.environment == 'Production'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Dispatch cd-failure
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.deployment.sha }}
+          REF: ${{ github.event.deployment.ref }}
+          DEPLOY_URL: ${{ github.event.deployment_status.log_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          jq -n \
+            --arg sha "${SHA}" \
+            --arg ref "${REF}" \
+            --arg url "${DEPLOY_URL}" \
+            '{"event_type":"cd-failure","client_payload":{"sha":$sha,"ref":$ref,"deployment_url":$url}}' | \
+            gh api "repos/${REPO}/dispatches" --method POST --input -

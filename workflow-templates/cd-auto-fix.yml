@@ -1,0 +1,263 @@
+# Auto-fix for Vercel production deployment failures. Receives the
+# `cd-failure` repository_dispatch (fired by cd.yml when `vercel deploy`
+# fails, or by cd-filter.yml when Vercel reports a failed Production
+# deployment) and runs a classify-then-fix state machine:
+#
+#   1. Check out the failing commit and reproduce the build locally.
+#   2. Not reproducible (build passes locally -> platform/infra error): open a
+#      CATEGORY-BASED dedup issue instead of a per-commit one —
+#        "CD failure: Vercel deployment limit exceeded"       (vercel_error
+#          payload matches limit/quota keywords)
+#        "CD failure: Vercel production deployment unreachable" (everything else)
+#      A repeat failure adds a hit comment ("Another deployment failure —
+#      commit `<sha>`") to the existing open issue rather than opening a
+#      duplicate. No code fix is attempted.
+#   3. Reproducible (code bug): open a commit-specific issue
+#      ("CD failure: Production deployment of <sha7> failed"), run Claude on
+#      the captured build output, and open a risk-gated fix PR via open-fix-pr
+#      (low-risk -> auto-merge once CI passes; high-risk -> human review).
+#
+# All issue titles start with "CD failure:" so cd.yml auto-closes them on the
+# next successful deploy.
+#
+# No infinite-fix loop: the fix PR's pushes produce Preview deployments, and
+# cd-filter.yml only dispatches on Production failures; cd.yml only runs on
+# push to main.
+#
+# Setup:
+#   1. Vendor the composite actions from claude-dev-automation/actions/
+#      (install-claude, run-claude, check-existing-pr, mark-in-progress,
+#      open-fix-pr) into .github/actions/ in your repo.
+#   2. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope).
+#   3. Repo settings: allow GitHub Actions to create PRs; enable auto-merge;
+#      branch protection on main with your required checks.
+#   4. Install cd.yml (and optionally cd-filter.yml / cd-monitor.yml).
+name: Auto-fix CD failures
+
+on:
+  repository_dispatch:
+    types: [cd-failure]
+
+jobs:
+  auto-fix-cd:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cd-auto-fix-${{ github.event.client_payload.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.client_payload.sha }}
+          fetch-depth: 0
+
+      # ADAPT: toolchain setup for your build (Node version, package manager cache)
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - uses: ./.github/actions/install-claude
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The classification hinge: if the same commit builds cleanly here, the
+      # Vercel failure is a platform/config problem no code change can fix.
+      - name: Reproduce build error locally
+        id: build
+        # ADAPT: build-time env vars your build needs (e.g. framework NEXT_PUBLIC_* /
+        # VITE_* keys) — without them a valid build may fail here and misclassify
+        # an infra error as a code bug:
+        # env:
+        #   NEXT_PUBLIC_EXAMPLE: ${{ secrets.NEXT_PUBLIC_EXAMPLE }}
+        run: |
+          set +e
+          # ADAPT: the same build commands Vercel runs for your project
+          { npm run build > /tmp/build_raw.txt 2>&1; }
+          BUILD_EXIT=$?
+          { npx tsc --noEmit >> /tmp/build_raw.txt 2>&1; }
+          TSC_EXIT=$?
+          set -e
+          tail -300 /tmp/build_raw.txt > /tmp/build_logs.txt
+          if [[ "$BUILD_EXIT" -ne 0 || "$TSC_EXIT" -ne 0 ]]; then
+            echo "reproducible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reproducible=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find or create GitHub issue
+        id: issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.client_payload.sha }}
+          DEPLOY_URL: ${{ github.event.client_payload.deployment_url }}
+          VERCEL_ERROR: ${{ github.event.client_payload.vercel_error }}
+          REPRODUCIBLE: ${{ steps.build.outputs.reproducible }}
+        run: |
+          SHORT_SHA="${SHA:0:7}"
+          if [[ "$REPRODUCIBLE" == "true" ]]; then
+            TITLE="CD failure: Production deployment of ${SHORT_SHA} failed"
+            IS_INFRA=false
+          else
+            if echo "$VERCEL_ERROR" | grep -qiE "deployment.?limit|monthly.?limit|quota.?exceeded|rate.?limit"; then
+              TITLE="CD failure: Vercel deployment limit exceeded"
+            else
+              TITLE="CD failure: Vercel production deployment unreachable"
+            fi
+            IS_INFRA=true
+          fi
+          printf '%s' "$TITLE" > /tmp/issue_title.txt
+          EXISTING=$(gh issue list \
+            --state open \
+            --limit 50 \
+            --json number,title | \
+            jq --arg title "$TITLE" \
+              '[.[] | select(.title == $title)] | .[0] // empty')
+          if [[ -n "$EXISTING" ]]; then
+            NUMBER=$(echo "$EXISTING" | jq -r '.number')
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            if [[ "$IS_INFRA" == "true" ]]; then
+              gh issue comment "$NUMBER" \
+                --body "Another deployment failure — commit \`${SHORT_SHA}\`"$'\n'"**Run:** ${DEPLOY_URL}"
+            fi
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            if [[ "$IS_INFRA" == "true" ]]; then
+              BODY="**First failure:** commit \`${SHA}\`"$'\n\n'"**Run:** ${DEPLOY_URL}"$'\n\n'"This issue tracks Vercel production deployment failures that are not reproducible locally (platform/infra errors). It will be auto-closed when a deployment succeeds."
+            else
+              BODY="**Commit:** \`${SHA}\`"$'\n\n'"**Vercel logs:** ${DEPLOY_URL}"$'\n\n'"This issue was automatically created from a Vercel production deployment failure."
+            fi
+            ISSUE_URL=$(gh issue create \
+              --title "$TITLE" \
+              --body "$BODY")
+            NUMBER=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$')
+          fi
+          echo "number=${NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Comment and stop if not locally reproducible
+        if: steps.build.outputs.reproducible == 'false' && steps.issue.outputs.hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          DEPLOY_URL: ${{ github.event.client_payload.deployment_url }}
+        run: |
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body "The build succeeds locally — this is likely a Vercel environment variable or configuration issue, not a code bug. Check: ${DEPLOY_URL}"$'\n\n'"Manual investigation required. This issue will be auto-closed when a deployment succeeds."
+
+      # ADAPT: the framework-specific constraint inside the prompt (the
+      # "Next.js route constraint" paragraph) — replace with your stack's
+      # equivalent footgun, or delete the paragraph.
+      - name: Write prompt
+        if: steps.build.outputs.reproducible == 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          SHA: ${{ github.event.client_payload.sha }}
+          DEPLOY_URL: ${{ github.event.client_payload.deployment_url }}
+        run: |
+          {
+            echo "A Vercel production deployment failed. The build error was reproduced locally."
+            echo ""
+            echo "Commit: ${SHA}"
+            echo "Issue: #${ISSUE_NUMBER}"
+            echo "Vercel logs: ${DEPLOY_URL}"
+            echo ""
+            echo "## Build error output"
+            echo ""
+            cat /tmp/build_logs.txt
+            echo ""
+          } > /tmp/prompt.txt
+          cat >> /tmp/prompt.txt << 'EOF'
+          Analyze the build error above. Fix ONLY the application source file(s) that the error
+          stack trace points to. Do not make any other changes or improvements.
+
+          STRICT CONSTRAINTS:
+          - Do NOT modify any files under .github/ (workflow files are not the problem)
+          - Do NOT modify package.json, package-lock.json, or any config outside the error trace
+          - Do NOT make improvements unrelated to the build error
+          - Do NOT run any git commands — just edit the files
+          - Do NOT add code comments explaining what you changed
+
+          Next.js route constraint: Next.js route files (app/**/route.ts) only allow HTTP method exports (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS). Any other named export causes the "is not a valid Route export field" build error. If the fix requires extracting a helper function, put it in lib/ — never export it from the route file itself.
+
+          After making the fix, write two output files:
+
+          1. /tmp/summary.txt — a markdown summary with exactly these sections:
+          ## Problem
+          One or two sentences: what the build error was and what caused it.
+          ## Root cause
+          One sentence: where in the code the issue lives.
+          ## Fix
+          Bullet list — one line per file changed, explaining what was changed and why.
+
+          2. /tmp/risk.txt — a single word: low or high.
+          Write "low" if ALL of the following are true:
+            - 1 or 2 files changed
+            - The fix is a null guard, type safety fix, lint error, type error, or simple value correction
+            - No new functions, classes, or logic flows were added
+            - No auth, database schema, or API surface was touched
+          Write "high" for anything else; when in doubt use "high"
+
+          Write ONLY the word "low" or "high" to /tmp/risk.txt, nothing else.
+          EOF
+
+      - uses: ./.github/actions/check-existing-pr
+        if: steps.build.outputs.reproducible == 'true'
+        id: pr_check
+        with:
+          branch-prefix: fix/cd-issue-${{ steps.issue.outputs.number }}-
+
+      - uses: ./.github/actions/mark-in-progress
+        if: steps.build.outputs.reproducible == 'true' && steps.pr_check.outputs.skip != 'true'
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+
+      - name: Run Claude Code
+        if: steps.build.outputs.reproducible == 'true' && steps.pr_check.outputs.skip != 'true'
+        uses: ./.github/actions/run-claude
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          max-turns: '20'
+          extra-flags: '--dangerously-skip-permissions'
+
+      # Safeguard: even though the prompt forbids it, revert any .github/ edits
+      # so workflow modifications can never ride along in an auto-generated PR.
+      # Always revert to origin/main, NOT HEAD — the checked-out SHA is the
+      # failing commit and may carry older workflow versions; restoring from
+      # HEAD could silently downgrade workflows in the fix PR.
+      - name: Revert workflow file changes
+        if: steps.build.outputs.reproducible == 'true' && steps.pr_check.outputs.skip != 'true'
+        run: |
+          git fetch origin main --quiet
+          git checkout origin/main -- .github/ 2>/dev/null || true
+
+      - name: Check for code changes
+        id: changes
+        if: steps.build.outputs.reproducible == 'true' && steps.pr_check.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          CHANGED_FILES=$({ git diff --name-only; git ls-files --others --exclude-standard; } || true)
+          if [[ -z "$CHANGED_FILES" ]]; then
+            gh issue comment "${ISSUE_NUMBER}" \
+              --body "Claude analyzed the build failure but made no code changes. Manual investigation required."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open fix PR
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: ./.github/actions/open-fix-pr
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+          gh-pat: ${{ secrets.GH_PAT }}
+          branch-prefix: 'fix/cd-issue-'
+          commit-message: 'fix: auto-fix CD failure for issue'
+          extra-pr-note: '**Note:** merging this PR triggers a new production deployment.'
+          merge-flags: '--delete-branch'

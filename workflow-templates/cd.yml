@@ -1,0 +1,148 @@
+# CD pipeline: on push to main, call the repo's CI workflows in parallel via
+# workflow_call, then deploy to Vercel only when every check passes. This
+# guarantees production never receives a commit that failed CI.
+#
+# Self-healing wiring (the other side of each dispatch):
+#   - vercel deploy fails  -> repository_dispatch `cd-failure` -> cd-auto-fix.yml
+#   - migrations fail      -> repository_dispatch `db-failure` -> db-fix.yml (optional)
+#   - deploy succeeds      -> every open issue titled "CD failure: ..." is
+#     commented on and auto-closed (cd-auto-fix.yml and cd-monitor.yml both
+#     create issues with that title prefix — keep the prefix in sync)
+#
+# Vercel gating trick — this workflow must OWN all production deploys. Disable
+# Vercel's built-in git auto-deploy by adding to vercel.json:
+#     { "ignoreCommand": "exit 0" }
+# CAUTION: Vercel's ignoreCommand exit-code semantics are INVERTED relative to
+# Unix convention: exit 0 means "skip the build", exit 1 means "proceed with
+# the build". With `exit 0` Vercel never builds on git push, so the only
+# production deploys are the `npx vercel deploy --prod` below.
+#
+# Setup:
+#   1. Secrets: VERCEL_TOKEN (vercel.com -> Account Settings -> Tokens),
+#      GH_PAT (PAT with repo scope — used so issue/dispatch events are
+#      attributed to a human actor and not suppressed by GitHub).
+#   2. Repo variables (Settings -> Secrets and variables -> Actions ->
+#      Variables): VERCEL_ORG_ID and VERCEL_PROJECT_ID — both printed by
+#      `npx vercel link` into .vercel/project.json.
+#   3. Install cd-auto-fix.yml (and optionally db-fix.yml) — they receive the
+#      repository_dispatch events fired below. cd-monitor.yml catches the
+#      cases where this workflow itself fails to start or fails to dispatch.
+#   4. Optional Supabase migrations: secret SUPABASE_ACCESS_TOKEN + secret
+#      SUPABASE_URL, then uncomment the two OPTIONAL blocks below (they must
+#      be enabled together).
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+jobs:
+  # ADAPT: list your CI workflow files — one job per reusable workflow. Each
+  # referenced workflow must declare `on: workflow_call`. Add or remove jobs
+  # to match your repo, and keep the deploy job's `needs:` list in sync.
+  lint:
+    uses: ./.github/workflows/lint.yml
+    secrets: inherit
+
+  unit-test:
+    uses: ./.github/workflows/test.yml
+    secrets: inherit
+
+  deploy:
+    needs: [lint, unit-test] # ADAPT: must list every CI job above
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # ADAPT/OPTIONAL: database migrations (Supabase example kept, commented).
+      # Running migrations BEFORE the Vercel deploy guarantees the schema lands
+      # before the new code is served. Uncomment this block AND the
+      # "Trigger db-fix on migration failure" block below together, and adjust
+      # the cd-auto-fix dispatch condition as noted there.
+      #
+      # - uses: supabase/setup-cli@v2.1.1
+      #   with:
+      #     version: 2.108.0 # pin exactly — "latest" resolves via a GitHub API call and hits rate limits on busy runners
+      #
+      # - name: Apply migrations
+      #   id: apply-migrations
+      #   env:
+      #     SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      #     SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      #   run: |
+      #     PROJECT_REF=$(echo "$SUPABASE_URL" | sed 's|https://||;s|\.supabase\.co.*||')
+      #     supabase link --project-ref "$PROJECT_REF" --password ""
+      #     supabase db push
+
+      - name: Deploy to Vercel
+        id: deploy-vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }} # ADAPT: set as a repo variable (from .vercel/project.json "orgId")
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }} # ADAPT: set as a repo variable (from .vercel/project.json "projectId")
+        run: |
+          set -o pipefail
+          npx vercel deploy --prod --token="${VERCEL_TOKEN}" 2>&1 | tee /tmp/vercel_output.txt
+
+      # cd-auto-fix.yml and cd-monitor.yml title every issue they create with
+      # the "CD failure:" prefix precisely so this step can sweep them closed.
+      - name: Close open CD failure issues on successful deploy
+        if: steps.deploy-vercel.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${SHA:0:7}"
+          OPEN_ISSUES=$(gh issue list \
+            --state open \
+            --limit 50 \
+            --json number,title \
+            | jq -r '.[] | select(.title | startswith("CD failure:")) | .number')
+          if [[ -n "$OPEN_ISSUES" ]]; then
+            while IFS= read -r NUM; do
+              gh issue comment "$NUM" \
+                --body "Production deployment of \`${SHORT_SHA}\` succeeded. Auto-closing."
+              gh issue close "$NUM"
+            done <<< "$OPEN_ISSUES"
+          fi
+
+      # ADAPT/OPTIONAL: pairs with the "Apply migrations" step above — enable
+      # both together. When enabling, also change the cd-auto-fix dispatch
+      # condition below to:
+      #   if: failure() && steps.apply-migrations.outcome != 'failure' && github.event_name != 'repository_dispatch'
+      # so a migration failure fires ONLY db-failure, never cd-failure.
+      #
+      # - name: Trigger db-fix on migration failure
+      #   if: failure() && steps.apply-migrations.outcome == 'failure' && github.event_name != 'repository_dispatch'
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GH_PAT }}
+      #   run: |
+      #     jq -n \
+      #       --arg id "${{ github.run_id }}" \
+      #       --arg url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+      #       '{"event_type":"db-failure","client_payload":{"run_id":$id,"run_url":$url}}' \
+      #     | gh api repos/${{ github.repository }}/dispatches --method POST --input -
+
+      # The last 30 lines of Vercel CLI output ride along as `vercel_error` so
+      # cd-auto-fix.yml can classify infra failures (quota, limits) by keyword.
+      - name: Trigger cd-auto-fix on deploy failure
+        if: failure() && github.event_name != 'repository_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          VERCEL_ERR=$(tail -30 /tmp/vercel_output.txt 2>/dev/null | head -c 800 || true)
+          jq -n \
+            --arg sha "${{ github.sha }}" \
+            --arg url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg err "$VERCEL_ERR" \
+            '{"event_type":"cd-failure","client_payload":{"sha":$sha,"deployment_url":$url,"vercel_error":$err}}' \
+          | gh api repos/${{ github.repository }}/dispatches --method POST --input -

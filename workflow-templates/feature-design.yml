@@ -1,0 +1,401 @@
+# Feature pipeline — Phase 1 (design): adding `status: approved` to a feature
+# issue (#X) makes Claude research the codebase and open a design issue (#Y)
+# containing an ## Acceptance criteria checklist (tagged [AC-{#Y}-N]) and a
+# machine-parsed <!-- implementation-plan-json --> block. #X transitions to
+# `status: design-review`. After reviewing #Y, add `status: auto-implement` to
+# run feature-implement.yml (Phase 2).
+#
+# Setup:
+#   1. Vendor the composite actions from claude-dev-automation/actions/ into
+#      .github/actions/ in your repo: install-claude, run-claude.
+#      (run-claude delegates to run-claude-retry.sh — vendor
+#      claude-dev-automation/scripts/run-claude-retry.sh into
+#      .github/scripts/run-claude-retry.sh as well.)
+#   2. Secrets: ANTHROPIC_API_KEY (GITHUB_TOKEN is built in).
+#   3. Labels used: `status: approved`, `status: design-review`,
+#      `implementation`, `user review required`.
+#   4. Cross-linking conventions this workflow greps for (exact strings):
+#      - "Technical tracking: #N" in the feature issue BODY — a manually
+#        pre-written spec pair; a comment is invisible to the grep
+#      - "<!-- design-issue: N -->" in a comment on #X (posted by this workflow)
+#      - "See user-facing issue: #N" in a design issue body — lets you label
+#        the design issue instead of the feature issue
+#   5. `# ADAPT:` comments mark project-specific prompt content to customize.
+# See workflow-templates/FEATURE-PIPELINE.md for the full pipeline doc.
+name: "Feature: design"
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to design'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      issue_number:
+        description: 'Issue number to design'
+        required: true
+        type: string
+
+jobs:
+  # ── Phase 1: generate design proposal ────────────────────────────────────
+  design:
+    if: "github.event_name == 'workflow_call' || (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner) || (github.event_name == 'issues' && github.event.label.name == 'status: approved')"
+    runs-on: ubuntu-latest
+    concurrency:
+      group: feature-design-${{ github.event.issue.number || inputs.issue_number }}
+      cancel-in-progress: true
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/install-claude
+
+      - name: Resolve issue metadata
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          ISSUE_NUMBER="${EVENT_ISSUE_NUMBER:-$INPUT_ISSUE_NUMBER}"
+          ISSUE_TITLE=$(gh issue view "$ISSUE_NUMBER" --json title --jq '.title')
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body --jq '.body')
+          {
+            echo "ISSUE_NUMBER=$ISSUE_NUMBER"
+            echo "ISSUE_TITLE=$ISSUE_TITLE"
+            echo 'ISSUE_BODY<<BODY_EOF'
+            echo "$ISSUE_BODY"
+            echo 'BODY_EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Resolve direction (route #Y → #X if implementation label)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_LABELS=$(gh issue view "${ISSUE_NUMBER}" --json labels --jq '[.labels[].name] | join(",")')
+          if echo "$ISSUE_LABELS" | grep -q "implementation"; then
+            # Labeled issue is #Y — find #X via "See user-facing issue: #N"
+            FEATURE_NUMBER=$(echo "${ISSUE_BODY}" | grep -oE 'See user-facing issue: #[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+            if [[ -z "$FEATURE_NUMBER" ]]; then
+              gh issue comment "${ISSUE_NUMBER}" \
+                --body "Could not find the linked feature issue. Please add \`status: approved\` to the original feature request instead."
+              exit 0
+            fi
+            # Remove label from #Y, switch focus to #X
+            gh issue edit "${ISSUE_NUMBER}" --remove-label "status: approved" 2>/dev/null || true
+            ISSUE_NUMBER="$FEATURE_NUMBER"
+            ISSUE_TITLE=$(gh issue view "$ISSUE_NUMBER" --json title --jq '.title')
+            ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body --jq '.body')
+            {
+              echo "ISSUE_NUMBER=$ISSUE_NUMBER"
+              echo "ISSUE_TITLE=$ISSUE_TITLE"
+              echo 'ISSUE_BODY<<BODY_EOF'
+              echo "$ISSUE_BODY"
+              echo 'BODY_EOF'
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Swap label to design-review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue edit "${ISSUE_NUMBER}" \
+            --add-label "status: design-review" \
+            --remove-label "status: approved" 2>/dev/null || \
+          gh issue edit "${ISSUE_NUMBER}" \
+            --add-label "status: design-review" 2>/dev/null || true
+
+      - name: Check for existing implementation spec
+        id: existing_spec
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=""
+
+          # 1. Body contains "Technical tracking: #N" (manually cross-linked pairs)
+          EXISTING=$(echo "${ISSUE_BODY}" | grep -oE 'Technical tracking: #[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+
+          # 2. A previous completed run posted "<!-- design-issue: N -->" in a comment
+          if [[ -z "$EXISTING" ]]; then
+            EXISTING=$(gh issue view "${ISSUE_NUMBER}" --comments --json comments \
+              --jq '[.comments[] | select(.body != null) | .body | select(contains("design-issue:"))] | last' \
+              | grep -oE 'design-issue: [0-9]+' | grep -oE '[0-9]+' || true)
+          fi
+
+          # 3. A previous cancelled run created the design issue but never posted the comment
+          if [[ -z "$EXISTING" ]]; then
+            # ADAPT: "[Feature Request] " is the source project's title prefix for
+            # user-submitted requests — harmless if yours differ (sed is a no-op).
+            FEATURE_TITLE=$(printf '%s' "${ISSUE_TITLE}" | sed 's/^\[Feature Request\] //')
+            # $t is a jq variable passed via --arg, not a shell variable
+            # shellcheck disable=SC2016
+            EXISTING=$(gh issue list --state open --limit 50 --json number,title \
+              | jq -r --arg t "Design proposal: ${FEATURE_TITLE}" \
+              '.[] | select(.title == $t) | .number' | head -1 || true)
+          fi
+
+          if [[ -n "$EXISTING" ]]; then
+            echo "design_number=${EXISTING}" >> "$GITHUB_OUTPUT"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Link existing implementation spec
+        if: steps.existing_spec.outputs.exists == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DESIGN_NUMBER="${{ steps.existing_spec.outputs.design_number }}"
+          DESIGN_URL="https://github.com/${GITHUB_REPOSITORY}/issues/${DESIGN_NUMBER}"
+          {
+            echo "Implementation spec found: ${DESIGN_URL}"
+            echo ""
+            echo "Review and refine the spec in a Claude Code session if needed. When ready, add \`status: auto-implement\` to kick off implementation."
+            echo ""
+            echo "<!-- design-issue: ${DESIGN_NUMBER} -->"
+          } > /tmp/design_comment.txt
+          gh issue comment "${ISSUE_NUMBER}" --body-file /tmp/design_comment.txt
+
+      - name: Comment that design is starting
+        if: steps.existing_spec.outputs.exists != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body "Generating a design proposal for this feature. A design issue will be linked here shortly."
+
+      - name: Write design prompt
+        if: steps.existing_spec.outputs.exists != 'true'
+        run: |
+          # The prompt is deliberately built from several heredoc appends
+          # (SC2129 disabled below) so each ADAPT-marked chunk can be swapped
+          # independently.
+          FEATURE_TITLE=$(printf '%s' "${ISSUE_TITLE}" | sed 's/^\[Feature Request\] //')
+          printf '%s' "${ISSUE_BODY}" > /tmp/issue_body.txt
+          cat > /tmp/design_prompt.txt << EOF
+          A user-submitted feature request (issue #${ISSUE_NUMBER}) has been approved for design.
+
+          Feature: ${FEATURE_TITLE}
+
+          User's request:
+          $(cat /tmp/issue_body.txt)
+
+          Before writing the design, you MUST complete the following research steps:
+
+          1. Read the existing codebase. Identify which files the feature will touch, then read them with the Read tool. At minimum read the 2-3 source files most likely to be modified. Do not skip this — the design must reflect what the code actually does, not assumptions about it.
+
+          EOF
+          # ADAPT: step 2 below is generic external-service research guidance. If
+          # your product domain has recurring third-party integrations, replace it
+          # with concrete instructions naming the known backends and the exact API
+          # endpoints to probe (the source project — a job tracker — listed known
+          # ATS backends like Greenhouse/Lever/Workday and their public APIs).
+          # shellcheck disable=SC2129
+          cat >> /tmp/design_prompt.txt << EOF
+          2. Investigate any external services or URLs mentioned in the request. If the request involves a third-party website, API, or URL pattern:
+             - Fetch the URL(s) with Bash (curl -s -L with a realistic User-Agent) to see what the server actually returns
+             - Inspect the response for structured data (JSON-LD, inline JSON blobs, API endpoint references in JS bundle script src attributes)
+             - Check whether the site is backed by a known third-party service or API by looking for references in the page HTML or JS bundle filenames; if you find one, test its API directly to confirm you can retrieve structured data without JavaScript execution
+             - Do NOT trust user-stated assumptions about how a site works (e.g. "fully JavaScript-rendered") without verifying them yourself
+
+          3. Ground your design in what you found. The implementation must reflect actual observed behavior. If investigation reveals a simpler approach than what the user described (e.g. an existing API rather than an HTML parser), design the simpler approach and note the discrepancy.
+
+          Only after completing this research should you write the design proposal. Write the design to /tmp/design_proposal.md.
+
+          The design document must include these sections:
+
+          ## What the user wants
+          Restate the requirement in plain language. If the request is ambiguous, call out the ambiguity.
+
+          ## Proposed implementation
+          Describe the technical approach in 2-3 sentences.
+
+          ### Files to modify or create
+          Bullet list — one line per file with what changes and why.
+
+          ### UI changes
+          For any user-visible change: which component, where exactly in the UI it appears, and how the user interacts with it. If there is no UI change, state that explicitly and explain why the feature is complete without one.
+
+          ## Implementation plan
+
+          List discrete implementation steps that Claude Code will execute during the implement phase. Output this section in EXACTLY the format shown below — the JSON in the HTML comment is machine-parsed by the implement workflow and must be valid.
+
+          CRITICAL: each object's "id" field MUST equal the step number in the corresponding "Step N:" checkbox (id:1 → "Step 1:", id:2 → "Step 2:", etc.). The implement workflow uses this to tick off checkboxes as each step completes.
+
+          EOF
+          # ADAPT: the test_file examples below assume unit tests live under
+          # __tests__/ — change to your project's test-directory convention
+          # (keep it consistent with feature-implement.yml's validation commands).
+          cat >> /tmp/design_prompt.txt << EOF
+          <!-- implementation-plan-json
+          [
+            {"id":1,"title":"<one-line title>","scope":"<what to implement — specific enough that no research is needed>","files_to_create":["path/to/new/file.ts"],"files_to_modify":[],"test_file":"__tests__/path/to/test.ts","estimated_turns":10,"ac_items":[1,2]},
+            {"id":2,"title":"<one-line title>","scope":"<what to implement>","files_to_create":[],"files_to_modify":["path/to/existing/file.ts"],"test_file":"__tests__/path/to/test.ts","estimated_turns":15,"ac_items":[3]}
+          ]
+          -->
+
+          - [ ] **Step 1: <title>** (~<N> turns) — <one-sentence scope summary>
+          - [ ] **Step 2: <title>** (~<N> turns) — <one-sentence scope summary>
+
+          Sizing rules for estimated_turns (MUST be <= 25 — split any step that would exceed this):
+          - 10-15 turns: simple API route or isolated UI change (1-2 files)
+          - 15-25 turns: component with multiple interactions or data flow (2-3 files)
+          Each test_file is a single path under __tests__/; files_to_create and files_to_modify are relative paths from repo root; call out step dependencies (e.g. "Step 2 depends on Step 1") explicitly.
+
+          The "ac_items" field lists the 1-based positions of Acceptance Criteria items whose unit tests this step writes. Assign each AC item to the step that implements the corresponding feature. Leave an AC item UNASSIGNED (omit from all ac_items lists) only if it tests integrated behavior spanning multiple steps — the implement workflow auto-generates a final "Write AC tests" step for any unassigned items. Every AC item must appear in exactly one step's ac_items list, or be left unassigned; never list the same item twice.
+
+          EOF
+          # ADAPT: insert your project's test-authoring conventions here (fixture
+          # loading rules, mocking patterns, import constraints) so planned test
+          # files follow them. Example from the source project: "Non-JSON fixtures
+          # must be loaded with readFileSync from node:fs — never with the ?raw
+          # Vite import suffix, which is Vite-specific and would break if the
+          # build config changes."
+          cat >> /tmp/design_prompt.txt << EOF
+          ## Design decisions
+          For each non-obvious choice in the proposed implementation, state: (a) what was chosen, (b) the main alternative considered, and (c) why the chosen approach is better for this codebase. Skip decisions where the choice is obvious or has no meaningful alternative.
+
+          EOF
+          # ADAPT: the "under our control" list below describes what YOUR local
+          # test environment can provide (dev server, mocked network, local
+          # database/auth). The source project listed: UI state on localhost:3000,
+          # page.route() interception, and local Supabase data/auth state.
+          cat >> /tmp/design_prompt.txt << EOF
+          ## Acceptance criteria
+          Checklist of behaviors the verify-ac workflow will test automatically with Playwright or unit tests.
+          Only include items where ALL inputs are under our control in a test environment:
+          - UI interactions and visible state on the locally running app
+          - Network interception (page.route() to mock API responses, simulate errors, or assert a call was/was not made)
+          - Local test database data and auth state
+          Do NOT include anything that depends on live external state. If an item requires a real URL, a real email,
+          or a live third-party API response to verify, it belongs in Human verification steps instead.
+          At least one item must be a user-visible UI interaction.
+          IMPORTANT: number each item with its 1-based position using **N.** format — the workflow will automatically replace these with the actual [AC-{issue}-N] tags after the issue is created:
+          - [ ] **1.** First criterion
+          - [ ] **2.** Second criterion
+
+          ## Human verification steps
+          Checklist for the PR reviewer to verify manually before merging.
+          Only include items that depend on live external state that can change independently of the code:
+          real URLs or content that may go stale, real email receipt, live API responses with real data.
+          If none exist, write "None."
+
+          ## Open questions
+          Before listing any question here, attempt to resolve it using the tools available to you (Read, Bash). Any question answerable by reading a file, fetching a URL, or grepping the codebase is NOT a valid open question — resolve it yourself first. Only list questions that require information genuinely impossible to obtain through investigation: proprietary credentials, business-scope decisions, or configuration specific to the owner's account. If none remain after investigation, write "None."
+
+          Do not implement anything. Write only the design document.
+          EOF
+          # ADAPT: append any project-specific framework constraints the design
+          # must respect. Example from the source project: "Next.js route files
+          # (app/**/route.ts) only allow HTTP method exports — any helper function
+          # that tests import directly must live in lib/, never be exported from
+          # the route file itself."
+
+      - name: Run Claude to generate design
+        if: steps.existing_spec.outputs.exists != 'true'
+        uses: ./.github/actions/run-claude
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt-file: '/tmp/design_prompt.txt'
+          max-turns: '30'
+
+      - name: Commit design file to .github/designs
+        if: steps.existing_spec.outputs.exists != 'true'
+        run: |
+          if [[ ! -s /tmp/design_proposal.md ]]; then
+            echo "No design proposal — skipping commit"
+            exit 0
+          fi
+          FEATURE_TITLE=$(printf '%s' "${ISSUE_TITLE}" | sed 's/^\[Feature Request\] //')
+          SLUG=$(printf '%s' "${FEATURE_TITLE}" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//' | cut -c1-50)
+          DESIGN_FILE=".github/designs/issue-${ISSUE_NUMBER}-${SLUG}.md"
+          DESIGN_BRANCH="design/issue-${ISSUE_NUMBER}-${SLUG}"
+          mkdir -p .github/designs
+          {
+            echo "_Design for feature request #${ISSUE_NUMBER}: ${ISSUE_TITLE}_"
+            echo ""
+            cat /tmp/design_proposal.md
+          } > "${DESIGN_FILE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${DESIGN_BRANCH}"
+          git add "${DESIGN_FILE}"
+          git commit -m "design: add proposal for #${ISSUE_NUMBER} (${FEATURE_TITLE})"
+          if git push --force origin "${DESIGN_BRANCH}"; then
+            {
+              echo "DESIGN_FILE=${DESIGN_FILE}"
+              echo "DESIGN_BRANCH=${DESIGN_BRANCH}"
+            } >> "$GITHUB_ENV"
+          else
+            echo "Warning: could not push design branch — design file link will be omitted"
+          fi
+
+      - name: Create design issue and link back
+        if: steps.existing_spec.outputs.exists != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ ! -s /tmp/design_proposal.md ]]; then
+            gh label create "user review required" --force 2>/dev/null || true
+            gh issue edit "${ISSUE_NUMBER}" \
+              --add-label "user review required" \
+              --remove-label "status: design-review" 2>/dev/null || true
+            FAILURE_TAIL=$(tail -50 /tmp/claude_output.txt 2>/dev/null || echo "(no output captured)")
+            # ADAPT: the retry guidance below — the source project pointed at its
+            # /triage-user-request slash command for clarifying requirements.
+            {
+              echo "Design generation failed — Claude did not produce a proposal."
+              echo ""
+              echo "Clarify the requirements on this issue in a Claude Code session, then re-add \`status: approved\` to retry."
+              echo ""
+              echo "<details><summary>Claude output</summary>"
+              echo ""
+              echo '```'
+              echo "${FAILURE_TAIL}"
+              echo '```'
+              echo ""
+              echo "</details>"
+            } > /tmp/failure_comment.txt
+            gh issue comment "${ISSUE_NUMBER}" --body-file /tmp/failure_comment.txt
+            exit 0
+          fi
+
+          FEATURE_TITLE=$(printf '%s' "${ISSUE_TITLE}" | sed 's/^\[Feature Request\] //')
+
+          {
+            echo "_Design for feature request #${ISSUE_NUMBER}: ${ISSUE_TITLE}_"
+            echo ""
+            echo "> [!WARNING]"
+            echo "> The \`<!-- implementation-plan-json -->\` block in the Implementation plan section is machine-parsed by the implement workflow. Edit the \`- [ ]\` checkboxes to adjust the plan — do not edit the JSON directly."
+            echo ""
+            cat /tmp/design_proposal.md
+          } > /tmp/design_body.txt
+
+          DESIGN_URL=$(gh issue create \
+            --title "Design proposal: ${FEATURE_TITLE}" \
+            --body-file /tmp/design_body.txt \
+            --label "user review required,implementation")
+          DESIGN_NUMBER=$(echo "$DESIGN_URL" | grep -oE '[0-9]+$')
+
+          # Replace **N.** placeholders with actual [AC-{DESIGN_NUMBER}-N] tags, only within the AC section
+          python3 -c "import re; dn='${DESIGN_NUMBER}'; n=[0]; body=open('/tmp/design_body.txt').read(); ac_re=re.compile(r'(## Acceptance criteria\n)(.*?)(\n## |\n<!--|$)', re.DOTALL); item_re=re.compile(r'^- (\[[ x]\]) \*\*\d+\.\*\* (.+)$', re.MULTILINE); f=lambda m: '- '+m.group(1)+' [AC-'+dn+'-'+str(n.__setitem__(0,n[0]+1) or n[0])+'] '+m.group(2); rs=lambda m: m.group(1)+item_re.sub(f, m.group(2))+m.group(3); open('/tmp/design_body_tagged.txt','w').write(ac_re.sub(rs, body))" && gh issue edit "$DESIGN_NUMBER" --body-file /tmp/design_body_tagged.txt
+
+          {
+            echo "Design proposal ready for review: ${DESIGN_URL}"
+            echo ""
+            if [[ -n "${DESIGN_BRANCH}" ]]; then
+              echo "Design file: [\`${DESIGN_FILE}\`](https://github.com/${GITHUB_REPOSITORY}/blob/${DESIGN_BRANCH}/${DESIGN_FILE})"
+              echo ""
+            fi
+            echo "Discuss and refine the design (ad-hoc in a Claude Code session works well). When the design looks good, add \`status: auto-implement\` to this issue to kick off implementation."
+            echo ""
+            echo "<!-- design-issue: ${DESIGN_NUMBER} -->"
+          } > /tmp/design_comment.txt
+          gh issue comment "${ISSUE_NUMBER}" --body-file /tmp/design_comment.txt

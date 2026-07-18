@@ -1,0 +1,430 @@
+# Sentry auto-fix pipeline: a Sentry alert (relayed by the webhook bridge in
+# integrations/sentry-webhook/) fires a `sentry-issue` repository_dispatch.
+# This workflow finds or creates a matching GitHub issue, fetches the full
+# Sentry event (stack trace, error type/message, culprit) so Claude sees more
+# than a vague title, has Claude fix the bug, verifies with local CI, and opens
+# a risk-gated PR (low-risk → auto-merge once CI passes; high-risk → review).
+# Closing the GitHub issue resolves the Sentry issue automatically.
+#
+# Both trigger paths fire simultaneously when an alert goes off: the webhook
+# dispatch AND sentry[bot] opening a GitHub issue. The concurrency group queues
+# them (cancel-in-progress: false) and the dedup guards below (open-issue title
+# match, closed-issue check, duplicate-PR check) prevent double fixes.
+#
+# Setup:
+#   1. Vendor the composite actions from claude-dev-automation/actions/ into
+#      .github/actions/ in your repo (or, if the library repo is public,
+#      replace `./.github/actions/<name>` with
+#      `zhaoanliu/claude-dev-automation/actions/<name>@v1`).
+#   2. Deploy the webhook bridge (integrations/sentry-webhook/route.ts) in your
+#      app and configure Sentry — see integrations/sentry-webhook/SETUP.md.
+#   3. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope),
+#      SENTRY_AUTH_TOKEN (Sentry token with Issue & Event: Read & Write —
+#      NOT the same token as a source-map-upload token).
+#   4. Repo settings: allow GitHub Actions to create PRs; enable auto-merge;
+#      branch protection on main with your required checks.
+#   5. Adaptation points are marked with `# ADAPT:` comments — dependency
+#      install, local CI commands, and project-specific prompt constraints.
+#   6. Optional telemetry: pass telemetry-url / telemetry-api-key to install-claude.
+#
+# Test the workflow directly (do not trigger a live crash end-to-end):
+#   gh api repos/OWNER/REPO/dispatches --method POST \
+#     -f event_type=sentry-issue \
+#     -f 'client_payload[title]=TypeError: your error here' \
+#     -f 'client_payload[sentry_url]=https://sentry.io/organizations/ORG/issues/ISSUE_ID/' \
+#     -f 'client_payload[culprit]=/affected-route'
+name: Sentry auto-fix
+
+on:
+  issues:
+    types: [opened, reopened, closed]
+  repository_dispatch:
+    types: [sentry-issue]
+
+jobs:
+  clear-in-progress-on-close:
+    if: github.event_name == 'issues' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove status:in-progress label
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "${ISSUE_NUMBER}" --repo "${{ github.repository }}" --remove-label "status: in progress" || true
+
+  # Merging a fix PR closes the linked issue (Closes #N), which triggers this
+  # job to resolve the Sentry issue — no manual Sentry API call needed.
+  resolve-sentry-on-close:
+    if: github.event_name == 'issues' && github.event.action == 'closed' && contains(github.event.issue.body, 'sentry.io')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve Sentry issue
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          SENTRY_ID=$(printf '%s' "${ISSUE_BODY}" | grep -oE '[0-9]{7,}' | head -1)
+          if [[ -n "${SENTRY_ID}" && -n "${SENTRY_AUTH_TOKEN}" ]]; then
+            RESULT=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X PUT "https://sentry.io/api/0/issues/${SENTRY_ID}/" \
+              -H "Authorization: Bearer ${SENTRY_AUTH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"status":"resolved"}')
+            echo "Sentry resolve HTTP ${RESULT} for issue ${SENTRY_ID}"
+          fi
+
+  auto-fix:
+    if: github.event_name == 'repository_dispatch' || (github.event_name == 'issues' && (github.event.action == 'opened' || github.event.action == 'reopened') && contains(github.event.issue.body, 'sentry.io'))
+    runs-on: ubuntu-latest
+    # Queue (never cancel) concurrent runs: the webhook dispatch and the
+    # sentry[bot]-opened issue arrive at the same time for the same alert.
+    concurrency:
+      group: sentry-auto-fix
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/install-claude
+
+      - name: Find or create GitHub issue
+        id: issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SENTRY_URL: ${{ github.event.client_payload.sentry_url }}
+          SENTRY_TITLE: ${{ github.event.client_payload.title }}
+          SENTRY_CULPRIT: ${{ github.event.client_payload.culprit }}
+          ISSUES_NUMBER: ${{ github.event.issue.number }}
+          ISSUES_TITLE: ${{ github.event.issue.title }}
+          ISSUES_BODY: ${{ github.event.issue.body }}
+        run: |
+          if [[ "${{ github.event_name }}" == "issues" ]]; then
+            echo "number=${ISSUES_NUMBER}" >> "$GITHUB_OUTPUT"
+            SENTRY_ID=$(printf '%s' "${ISSUES_BODY}" | grep -oE '[0-9]{7,}' | head -1)
+            echo "sentry_id=${SENTRY_ID}" >> "$GITHUB_OUTPUT"
+            printf '%s' "${ISSUES_TITLE}" > /tmp/issue_title.txt
+            printf '%s' "${ISSUES_BODY}" > /tmp/issue_body.txt
+          else
+            # Extract numeric ID from Sentry URL — works for both
+            # https://sentry.io/api/0/.../issues/1234/ (webhook format) and
+            # https://org.sentry.io/issues/1234/ (sentry[bot] format)
+            SENTRY_ID=$(echo "${SENTRY_URL}" | grep -oE '[0-9]{7,}')
+            echo "sentry_id=${SENTRY_ID}" >> "$GITHUB_OUTPUT"
+            # Use the list API (not `gh issue list --search`) — the search index
+            # has non-deterministic lag on freshly-created issues. Match by
+            # title (not URL/ID) because the two trigger paths use different
+            # Sentry URL formats. Only search open issues here: sentry[bot]
+            # always creates a new open issue per alert, so there is no need to
+            # find and reopen an old closed one.
+            EXISTING=$(gh issue list \
+              --state open \
+              --limit 50 \
+              --json number,title | \
+              jq --arg title "${SENTRY_TITLE}" \
+                '[.[] | select(.title == $title)] | .[0] // empty')
+
+            if [[ -n "$EXISTING" ]]; then
+              NUMBER=$(echo "$EXISTING" | jq -r '.number')
+              echo "number=${NUMBER}" >> "$GITHUB_OUTPUT"
+              # A concurrent run may have already opened a PR for this issue.
+              # Branch names are fix/issue-N-<timestamp>, so match by prefix.
+              EXISTING_PR=$(gh pr list \
+                --state open \
+                --json number,headRefName | \
+                jq --arg prefix "fix/issue-${NUMBER}-" \
+                  '[.[] | select(.headRefName | startswith($prefix))] | .[0] // empty')
+              if [[ -n "$EXISTING_PR" ]]; then
+                PR_NUM=$(echo "$EXISTING_PR" | jq -r '.number')
+                echo "PR #${PR_NUM} already open for issue #${NUMBER}. Skipping."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+              fi
+            else
+              # A queued concurrent run may have already fixed this and closed
+              # the matching issue while we waited. Check closed issues here to
+              # avoid creating a duplicate and re-fixing already-fixed code.
+              RECENT_CLOSED=$(gh issue list \
+                --state closed \
+                --limit 20 \
+                --json number,title | \
+                jq --arg title "${SENTRY_TITLE}" \
+                  '[.[] | select(.title == $title)] | .[0] // empty')
+              if [[ -n "$RECENT_CLOSED" ]]; then
+                CLOSED_NUMBER=$(echo "$RECENT_CLOSED" | jq -r '.number')
+                echo "Concurrent run already fixed this (closed issue #${CLOSED_NUMBER}). Skipping."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+              else
+                ISSUE_URL=$(gh issue create \
+                  --title "${SENTRY_TITLE}" \
+                  --body "**Sentry issue:** ${SENTRY_URL}"$'\n\n'"**Culprit:** ${SENTRY_CULPRIT}"$'\n\n'"This issue was automatically created from a Sentry alert.")
+                NUMBER=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$')
+                echo "number=${NUMBER}" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+
+            printf '%s' "${SENTRY_TITLE}" > /tmp/issue_title.txt
+            printf 'Sentry issue: %s\nCulprit: %s' "${SENTRY_URL}" "${SENTRY_CULPRIT}" > /tmp/issue_body.txt
+          fi
+
+      # Without this, Claude only sees the vague issue title and exhausts its
+      # turn limit without finding the bug.
+      - name: Fetch Sentry details
+        if: steps.issue.outputs.skip != 'true'
+        id: sentry_details
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ID: ${{ steps.issue.outputs.sentry_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          if [[ -z "${SENTRY_ID}" || -z "${SENTRY_AUTH_TOKEN}" ]]; then
+            printf '' > /tmp/sentry_details.txt
+            exit 0
+          fi
+
+          ISSUE_JSON=$(curl -sf \
+            -H "Authorization: Bearer ${SENTRY_AUTH_TOKEN}" \
+            "https://sentry.io/api/0/issues/${SENTRY_ID}/" || echo '{}')
+
+          # replay_hydration_error has no stack trace and is never fixable in
+          # application code — typically caused by browser extensions.
+          ISSUE_TYPE=$(printf '%s' "$ISSUE_JSON" | jq -r '.issueType // ""')
+          if [[ "$ISSUE_TYPE" == "replay_hydration_error" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            gh issue comment "${ISSUE_NUMBER}" \
+              --body "Skipping auto-fix: Sentry issued this as \`replay_hydration_error\` — no stack trace is available. These are typically caused by browser extensions modifying the DOM and are not fixable in application code."
+            GH_TOKEN="${GH_PAT}" gh issue edit "${ISSUE_NUMBER}" --remove-label "status: in progress" || true
+            GH_TOKEN="${GH_PAT}" gh issue close "${ISSUE_NUMBER}"
+            exit 0
+          fi
+
+          EVENT_JSON=$(curl -sf \
+            -H "Authorization: Bearer ${SENTRY_AUTH_TOKEN}" \
+            "https://sentry.io/api/0/issues/${SENTRY_ID}/events/latest/" || echo '{}')
+
+          CULPRIT=$(printf '%s' "$ISSUE_JSON" | jq -r '.culprit // ""')
+          ERROR_TYPE=$(printf '%s' "$EVENT_JSON" | \
+            jq -r '.entries[]? | select(.type=="exception") | .data.values[-1]?.type // ""' | head -1)
+          ERROR_VALUE=$(printf '%s' "$EVENT_JSON" | \
+            jq -r '.entries[]? | select(.type=="exception") | .data.values[-1]?.value // ""' | head -1)
+
+          FRAMES=$(printf '%s' "$EVENT_JSON" | jq -r '
+            [
+              .entries[]? |
+              select(.type=="exception") |
+              .data.values[-1]?.stacktrace.frames? // [] |
+              .[]
+            ] | .[-8:] | .[] |
+            "\(if .inApp == true then "[app] " else "      " end)\(.filename // "unknown"):\(.lineNo // "?") in \(.function // "<anonymous>")"
+          ' 2>/dev/null)
+
+          {
+            [[ -n "$ERROR_TYPE" ]] && printf 'Error type: %s\n' "$ERROR_TYPE"
+            [[ -n "$ERROR_VALUE" ]] && printf 'Error message: %s\n' "$ERROR_VALUE"
+            [[ -n "$CULPRIT" ]] && printf 'Culprit: %s\n' "$CULPRIT"
+            if [[ -n "$FRAMES" ]]; then
+              printf '\nStack trace (most recent frames, [app] = your code):\n%s\n' "$FRAMES"
+            fi
+          } > /tmp/sentry_details.txt
+
+          cat /tmp/sentry_details.txt
+
+      - name: Write prompt file
+        if: steps.issue.outputs.skip != 'true' && steps.sentry_details.outputs.skip != 'true'
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          cat > /tmp/prompt.txt << 'EOF'
+          A bug has been reported as a GitHub issue.
+          EOF
+          {
+            echo "Issue #${ISSUE_NUMBER}: $(cat /tmp/issue_title.txt)"
+            echo ""
+            echo "Details:"
+            cat /tmp/issue_body.txt
+            echo ""
+            if [[ -s /tmp/sentry_details.txt ]]; then
+              echo "Sentry event details:"
+              cat /tmp/sentry_details.txt
+              echo ""
+            fi
+          } >> /tmp/prompt.txt
+          # ADAPT: append project-specific constraints to the block below (e.g.
+          # "do not remove env-var guards", "never touch files under X/"). Keep
+          # the /tmp/summary.txt and /tmp/risk.txt file contract intact — the
+          # open-fix-pr action reads both files.
+          cat >> /tmp/prompt.txt << 'EOF'
+          Start by using grep/search to find code relevant to the error message and stack trace — do NOT read files at random. Search for the file names and functions in the stack trace, then read only the files that match.
+          Analyze the error, find the root cause in the codebase, and fix it.
+          Do NOT run any git commands — just edit the files.
+          Do NOT modify any files under .github/ — workflow changes are out of scope.
+          Do NOT add code comments explaining what you changed.
+
+          After making the fix, write two output files:
+
+          1. /tmp/summary.txt — a markdown summary with exactly these sections:
+          ## Problem
+          One or two sentences: what the error was and how it manifested.
+          ## Root cause
+          One sentence: where in the code the issue lives.
+          ## Fix
+          Bullet list — one line per file changed, explaining what was changed and why.
+
+          2. /tmp/risk.txt — a single word: low or high.
+          Write "low" if ALL of the following are true:
+            - 1 or 2 files changed
+            - The fix is a null guard, type safety fix, or simple value correction
+            - No new functions, classes, or logic flows were added
+            - No auth, database schema, or API surface was touched
+          Write "high" for anything else, when in doubt use "high"
+
+          Write ONLY the word "low" or "high" to /tmp/risk.txt, nothing else.
+          EOF
+
+      - uses: ./.github/actions/check-existing-pr
+        id: pr_check
+        if: steps.issue.outputs.skip != 'true' && steps.sentry_details.outputs.skip != 'true'
+        with:
+          branch-prefix: fix/issue-${{ steps.issue.outputs.number }}-
+
+      - uses: ./.github/actions/mark-in-progress
+        if: steps.issue.outputs.skip != 'true' && steps.sentry_details.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+
+      - name: Run Claude Code
+        if: steps.issue.outputs.skip != 'true' && steps.sentry_details.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        uses: ./.github/actions/run-claude
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # Safeguard: even though the prompt forbids it, revert any .github/ edits
+      # so workflow modifications can never ride along in an auto-generated PR.
+      # Revert to origin/main, not HEAD — the checked-out SHA may be stale.
+      - name: Revert .github/ changes
+        if: steps.issue.outputs.skip != 'true' && steps.sentry_details.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        run: |
+          git fetch origin main
+          git checkout origin/main -- .github/ 2>/dev/null || true
+
+      - name: Verify fix with local CI
+        if: steps.issue.outputs.skip != 'true' && steps.sentry_details.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # ADAPT: your dependency install command
+          npm ci
+
+          # ADAPT: your local CI commands — mirror exactly what your required
+          # CI checks run, so a fix that passes here also passes the PR checks.
+          run_ci() {
+            LINT_OK=true; TSC_OK=true; TEST_OK=true
+            npm run lint > /tmp/lint_out.txt 2>&1 || LINT_OK=false
+            npx tsc --noEmit > /tmp/tsc_out.txt 2>&1 || TSC_OK=false
+            npm run test:coverage > /tmp/test_out.txt 2>&1 || TEST_OK=false
+            [[ "$LINT_OK" == true && "$TSC_OK" == true && "$TEST_OK" == true ]]
+          }
+
+          if run_ci; then
+            echo "CI_PASS=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "Local CI failed — running one fix attempt"
+          : > /tmp/ci_failures.txt
+          if [[ "$LINT_OK" != true ]]; then
+            { echo "=== lint ==="; tail -30 /tmp/lint_out.txt; echo ""; } >> /tmp/ci_failures.txt
+          fi
+          if [[ "$TSC_OK" != true ]]; then
+            { echo "=== tsc ==="; tail -30 /tmp/tsc_out.txt; echo ""; } >> /tmp/ci_failures.txt
+          fi
+          if [[ "$TEST_OK" != true ]]; then
+            { echo "=== tests ==="; tail -50 /tmp/test_out.txt; echo ""; } >> /tmp/ci_failures.txt
+          fi
+
+          GIT_DIFF=$(git diff HEAD 2>/dev/null | head -c 20000)
+          NEW_FILES=$({ git diff --name-only; git ls-files --others --exclude-standard; } 2>/dev/null)
+          {
+            echo "Your fix attempt failed local CI. Fix the remaining failures."
+            echo ""
+            if [[ -n "$NEW_FILES" ]]; then
+              echo "=== New/modified files ==="
+              echo "$NEW_FILES"
+              echo ""
+            fi
+            if [[ -n "$GIT_DIFF" ]]; then
+              echo "=== Changes so far ==="
+              echo "$GIT_DIFF"
+              echo ""
+            fi
+            echo "=== CI failures to fix ==="
+            cat /tmp/ci_failures.txt
+            # ADAPT: your local CI commands (same as run_ci above)
+            echo "Validate: npm run lint && npx tsc --noEmit && npm run test:coverage"
+          } > /tmp/fix_prompt.txt
+
+          DELAY=30
+          for fix_attempt in 1 2; do
+            set +eo pipefail
+            claude --max-turns 15 \
+              -p "$(cat /tmp/fix_prompt.txt)" 2>&1 | tee /tmp/fix_output.txt
+            set -eo pipefail
+            if grep -q "529\|Overloaded\|at capacity" /tmp/fix_output.txt && [[ $fix_attempt -lt 2 ]]; then
+              sleep $DELAY
+              DELAY=$((DELAY * 2))
+              continue
+            fi
+            if run_ci; then
+              echo "CI_PASS=true" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+
+          echo "CI_PASS=false" >> "$GITHUB_ENV"
+          echo "Local CI still failing after fix attempts — will open draft PR"
+
+      # The "no changes made" path must close the issue AND resolve Sentry —
+      # a bare exit would leave both permanently open.
+      - name: Check for app-code changes
+        id: changes
+        if: steps.issue.outputs.skip != 'true' && steps.sentry_details.outputs.skip != 'true' && steps.pr_check.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ID: ${{ steps.issue.outputs.sentry_id }}
+        run: |
+          if [[ -z $(git diff --name-only) ]]; then
+            echo "No app-code fix identified — closing issue and resolving Sentry"
+            gh issue comment "${ISSUE_NUMBER}" \
+              --body "No application code fix identified. This error appears to be caused by factors outside the application (browser extensions, environment, etc.) and is not fixable in the codebase."
+            GH_TOKEN="${GH_PAT}" gh issue edit "${ISSUE_NUMBER}" --remove-label "status: in progress" || true
+            GH_TOKEN="${GH_PAT}" gh issue close "${ISSUE_NUMBER}"
+            if [[ -n "${SENTRY_ID}" && -n "${SENTRY_AUTH_TOKEN}" ]]; then
+              RESULT=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X PUT "https://sentry.io/api/0/issues/${SENTRY_ID}/" \
+                -H "Authorization: Bearer ${SENTRY_AUTH_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d '{"status":"resolved"}')
+              echo "Sentry resolve HTTP ${RESULT} for issue ${SENTRY_ID}"
+            fi
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open fix PR
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: ./.github/actions/open-fix-pr
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+          gh-pat: ${{ secrets.GH_PAT }}
+          commit-message: 'fix: auto-fix attempt for issue'
+          ci-passed: ${{ env.CI_PASS }}
+          merge-comment-suffix: 'Sentry will be resolved automatically when this issue closes.'

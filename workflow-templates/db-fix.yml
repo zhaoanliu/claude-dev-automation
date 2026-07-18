@@ -1,0 +1,191 @@
+# OPTIONAL — Supabase-specific template. Only install this if your CD
+# pipeline applies Supabase migrations (`supabase db push`) before deploying;
+# skip it entirely for projects without a database migration step.
+#
+# Auto-fix for production DB migration failures. Receives the `db-failure`
+# repository_dispatch (fired by cd.yml when `supabase db push` fails) and
+# classifies the failure from the run logs:
+#
+#   - SQL/schema error (syntax, constraint, policy conflict, missing column):
+#     runs Claude — constrained to files under supabase/migrations/ only —
+#     and opens a fix PR.
+#   - Infra error (auth, network, configuration): comments on the tracking
+#     issue for manual investigation; no code fix attempted.
+#
+# NEVER-AUTO-MERGE POLICY: unlike the other auto-fix workflows, this one
+# deliberately does not use the risk-gated open-fix-pr action. Migration fixes
+# touch the production database, so the PR always requires human review —
+# there is no low-risk path and no auto-merge, by design. Do not "upgrade"
+# this workflow to auto-merge.
+#
+# Setup:
+#   1. Vendor the composite actions from claude-dev-automation/actions/
+#      (install-claude, run-claude, mark-in-progress) into .github/actions/.
+#   2. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope).
+#   3. Install cd.yml with its OPTIONAL migration blocks uncommented — they
+#      fire the db-failure dispatch this workflow listens for.
+name: Auto-fix DB migration failures
+
+on:
+  repository_dispatch:
+    types: [db-failure]
+
+jobs:
+  db-fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/install-claude
+
+      # PostgreSQL error keywords -> code-fixable; anything else (auth,
+      # network, CLI misconfiguration) -> infra, not fixable by editing SQL.
+      - name: Get failure logs
+        id: logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.client_payload.run_id }}
+        run: |
+          gh run view "$RUN_ID" --log-failed 2>&1 | head -200 > /tmp/db_logs.txt
+          cat /tmp/db_logs.txt
+          if grep -qiE "ERROR:|syntax error|already exists|does not exist|violates|constraint|column|relation|permission denied" /tmp/db_logs.txt; then
+            echo "error_type=code" >> "$GITHUB_OUTPUT"
+          else
+            echo "error_type=infra" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find or create GitHub issue
+        id: issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.event.client_payload.run_url }}
+        run: |
+          TITLE="DB migration failure: production push failed"
+          EXISTING=$(gh issue list \
+            --state open \
+            --limit 50 \
+            --json number,title | \
+            jq --arg title "$TITLE" \
+              '[.[] | select(.title == $title)] | .[0] // empty')
+          if [[ -n "$EXISTING" ]]; then
+            NUMBER=$(echo "$EXISTING" | jq -r '.number')
+          else
+            ISSUE_URL=$(gh issue create \
+              --title "$TITLE" \
+              --body "**Run:** ${RUN_URL}"$'\n\n'"This issue was automatically created from a production DB migration failure.")
+            NUMBER=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$')
+          fi
+          echo "number=${NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on infra error
+        if: steps.logs.outputs.error_type == 'infra'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          RUN_URL: ${{ github.event.client_payload.run_url }}
+        run: |
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body "DB migration failed with an infrastructure error (auth, network, or configuration issue) — not fixable by code changes. Manual investigation required. Run: ${RUN_URL}"
+
+      - name: Write prompt
+        if: steps.logs.outputs.error_type == 'code'
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          {
+            echo "A production database migration failed with a SQL or schema error that needs to be fixed in the migration file."
+            echo ""
+            echo "Issue: #${ISSUE_NUMBER}"
+            echo ""
+            echo "## Migration failure logs"
+            echo ""
+            cat /tmp/db_logs.txt
+            echo ""
+          } > /tmp/prompt.txt
+          cat >> /tmp/prompt.txt << 'EOF'
+          Analyze the migration failure above. Find the root cause in the migration files under supabase/migrations/ and fix it.
+          Do NOT run any git commands — just edit the files.
+          Do NOT modify any files under .github/ — workflow changes are out of scope.
+          Do NOT modify any files outside supabase/migrations/.
+          Do NOT add code comments explaining what you changed.
+
+          After making the fix, write a markdown summary to /tmp/summary.txt with these sections:
+          ## Problem
+          One or two sentences: what the migration error was and what caused it.
+          ## Root cause
+          One sentence: which migration file had the issue and why.
+          ## Fix
+          Bullet list — one line per file changed, explaining what was corrected and why.
+          EOF
+
+      - uses: ./.github/actions/mark-in-progress
+        if: steps.logs.outputs.error_type == 'code'
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+
+      - name: Run Claude Code
+        if: steps.logs.outputs.error_type == 'code'
+        uses: ./.github/actions/run-claude
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          max-turns: '10'
+          extra-flags: '--dangerously-skip-permissions'
+
+      # Inline PR creation (not open-fix-pr) is deliberate: only files under
+      # supabase/migrations/ are staged, and the PR is never auto-merged.
+      - name: Open PR
+        if: steps.logs.outputs.error_type == 'code'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          CHANGED_FILES=$({ git diff --name-only; git ls-files --others --exclude-standard; } || true)
+          if [[ -z "$CHANGED_FILES" ]]; then
+            gh issue comment "${ISSUE_NUMBER}" \
+              --body "Claude analyzed the migration failure but made no changes. Manual investigation required."
+            exit 0
+          fi
+          git add supabase/migrations/
+          FILES_CHANGED=$(git diff --cached --name-only | wc -l | tr -d ' ')
+          STATS=$(git diff --cached --shortstat)
+          INSERTIONS=$(echo "$STATS" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
+          DELETIONS=$(echo "$STATS" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
+          TOTAL_LINES=$(( ${INSERTIONS:-0} + ${DELETIONS:-0} ))
+          if [[ "$FILES_CHANGED" == "0" ]]; then
+            gh issue comment "${ISSUE_NUMBER}" \
+              --body "Claude made changes, but none under supabase/migrations/ — nothing to propose. Manual investigation required."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH="fix/db-issue-${ISSUE_NUMBER}-$(date +%s)"
+          git checkout -b "$BRANCH"
+          git commit -m "fix: repair migration for issue #${ISSUE_NUMBER}"
+          git push origin "$BRANCH"
+          {
+            echo "Closes #${ISSUE_NUMBER}"
+            echo ""
+            echo "**Migration fix** (${FILES_CHANGED} file(s), ${TOTAL_LINES} lines changed) — requires manual review before merging."
+            if [[ -s /tmp/summary.txt ]]; then
+              echo ""
+              cat /tmp/summary.txt
+            fi
+          } > /tmp/pr_body.txt
+          PR_URL=$(GH_TOKEN="${GH_PAT}" gh pr create \
+            --title "DB migration failure: production push failed (#${ISSUE_NUMBER})" \
+            --body-file /tmp/pr_body.txt \
+            --base main)
+          {
+            if [[ -s /tmp/summary.txt ]]; then
+              cat /tmp/summary.txt
+              echo ""
+            fi
+            echo "A migration fix has been proposed: $PR_URL — please review carefully before merging as this affects the production database."
+          } > /tmp/issue_comment.txt
+          gh issue comment "${ISSUE_NUMBER}" --body-file /tmp/issue_comment.txt
