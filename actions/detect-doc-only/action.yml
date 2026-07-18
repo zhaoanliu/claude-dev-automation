@@ -1,0 +1,38 @@
+name: Detect doc-only changes
+description: >
+  Outputs skip=true when a pull_request touches only documentation files.
+  Use this as a detect-changes job with needs/if on the main job — NOT
+  workflow-level paths-ignore, which leaves required checks stuck as
+  "pending" because a never-triggered workflow creates no check run.
+
+inputs:
+  doc-pattern:
+    description: 'Extended regex matching doc-only paths'
+    required: false
+    default: '\.md$|^docs/'
+
+outputs:
+  skip:
+    description: 'true if all changed files are docs — callers should skip expensive jobs'
+    value: ${{ steps.check.outputs.skip }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_REF: ${{ github.base_ref }}
+        DOC_PATTERN: ${{ inputs.doc-pattern }}
+      run: |
+        if [[ "$EVENT_NAME" == "pull_request" ]]; then
+          CHANGED=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          if [[ -n "$CHANGED" ]]; then
+            NON_DOC=$(echo "$CHANGED" | { grep -Ev "$DOC_PATTERN" || true; } | wc -l | tr -d ' ')
+            if [[ "$NON_DOC" -eq 0 ]]; then
+              echo "Doc-only change — skipping"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+        fi

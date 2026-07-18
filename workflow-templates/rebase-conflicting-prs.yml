@@ -1,0 +1,101 @@
+# On every push to main, rebase all open conflicting PRs. Clean rebases push
+# directly; conflicted files go to Claude with an objective additive-vs-rewrite
+# rule (no judgment calls); unresolvable PRs get a `merge conflict` label and a
+# comment instead.
+#
+# Setup: vendor the composite actions (see bug-fix.yml header note).
+# Secrets: ANTHROPIC_API_KEY, GH_PAT (checkout token MUST be GH_PAT — pushes made
+# with GITHUB_TOKEN suppress the pull_request CI triggers on the rebased PRs).
+name: Rebase conflicting PRs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: rebase-conflicting-prs
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git remote set-url origin "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git"
+
+      - uses: ./.github/actions/install-claude
+
+      - name: Ensure merge-conflict label exists
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: gh label create "merge conflict" --color "e11d48" --description "Branch conflicts with main — manual resolution required" --force
+
+      - name: Rebase conflicting PRs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          gh pr list --state open --json number,headRefName,mergeable \
+            --jq '.[] | [(.number | tostring), .headRefName, .mergeable] | @tsv' \
+          | while IFS=$'\t' read -r pr_num branch mergeable; do
+              echo "Checking PR #${pr_num} (${branch}): mergeable=${mergeable}"
+              if [[ "$mergeable" == "UNKNOWN" ]]; then
+                for i in 1 2 3 4 5 6; do
+                  sleep 5
+                  mergeable=$(gh pr view "$pr_num" --json mergeable --jq '.mergeable')
+                  echo "  Retry ${i}: ${mergeable}"
+                  if [[ "$mergeable" != "UNKNOWN" ]]; then break; fi
+                done
+              fi
+              if [[ "$mergeable" == "UNKNOWN" ]]; then
+                echo "PR #${pr_num}: still UNKNOWN after retries — labeling as potential conflict"
+                gh pr edit "$pr_num" --add-label "merge conflict"
+                gh pr comment "$pr_num" --body "GitHub could not determine mergeability within the retry window. Labeled as potential conflict — if the branch is actually clean, this label will be removed automatically on the next rebase run after mergeability resolves."
+                continue
+              fi
+              if [[ "$mergeable" != "CONFLICTING" ]]; then
+                echo "PR #${pr_num}: ${mergeable} — skipping"
+                continue
+              fi
+              echo "PR #${pr_num} is CONFLICTING — attempting rebase"
+              git fetch origin "$branch"
+              git checkout -B "$branch" "origin/$branch"
+              if git rebase origin/main; then
+                git push origin "HEAD:${branch}" --force-with-lease
+                gh pr edit "$pr_num" --remove-label "merge conflict" 2>/dev/null || true
+                echo "PR #${pr_num}: rebase succeeded"
+              else
+                CONFLICTED_FILES=$(git diff --name-only --diff-filter=U)
+                echo "PR #${pr_num}: conflict in ${CONFLICTED_FILES} — attempting Claude resolution"
+                PROMPT="Resolve git merge conflict markers in this rebase. Branch '${branch}' conflicts with main in: ${CONFLICTED_FILES}. For each conflicted file: (1) Read the file and locate every conflict block (<<<<<<< HEAD ... ======= ... >>>>>>> ...). (2) For each block apply exactly one of these two rules based on an objective test — do NOT use judgment about whether the content is 'related' or 'similar': RULE A (additive): if neither the HEAD side nor the incoming side deletes any pre-existing line (both sides consist entirely of new additions), keep ALL content from BOTH sides with HEAD content first then incoming content. This applies even when both sides add functions that serve similar purposes. RULE B (rewrite): if either side modifies or deletes a line that already existed before the conflict (e.g. a function body changed in two different ways), keep the HEAD version only. (3) Remove the conflict marker lines themselves. (4) Write the resolved file back. (5) Run: git add <filename>. After resolving all files stop — do not run git rebase --continue."
+                claude --max-turns 15 -p "$PROMPT"
+                REMAINING=$(git diff --name-only --diff-filter=U | wc -l | tr -d ' ')
+                if [[ "$REMAINING" -eq 0 ]]; then
+                  if GIT_EDITOR=true git rebase --continue; then
+                    git push origin "HEAD:${branch}" --force-with-lease
+                    gh pr edit "$pr_num" --remove-label "merge conflict" 2>/dev/null || true
+                    gh pr comment "$pr_num" --body "Auto-rebase succeeded with AI-assisted conflict resolution in: \`${CONFLICTED_FILES}\`"
+                    echo "PR #${pr_num}: Claude resolved conflicts successfully"
+                  else
+                    git rebase --abort
+                    gh pr edit "$pr_num" --add-label "merge conflict"
+                    gh pr comment "$pr_num" --body "Auto-rebase failed after AI conflict resolution — this PR has multiple conflicting commits that require manual resolution."
+                    echo "PR #${pr_num}: manual resolution required (multiple conflicting commits)"
+                  fi
+                else
+                  git rebase --abort
+                  gh pr edit "$pr_num" --add-label "merge conflict"
+                  gh pr comment "$pr_num" --body "Auto-rebase failed — this PR has conflicts with \`main\` that require manual resolution."
+                  echo "PR #${pr_num}: Claude could not fully resolve conflicts"
+                fi
+              fi
+            done

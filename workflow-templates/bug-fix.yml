@@ -1,0 +1,146 @@
+# Auto-fix bot: a `bug`-labeled issue gets analyzed by Claude, which opens a
+# risk-gated fix PR (low-risk → auto-merge once CI passes; high-risk → review).
+#
+# Setup:
+#   1. Vendor the composite actions from claude-dev-automation/actions/ into
+#      .github/actions/ in your repo (or, if the library repo is public,
+#      replace `./.github/actions/<name>` with
+#      `zhaoanliu/claude-dev-automation/actions/<name>@v1`).
+#   2. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope).
+#   3. Repo settings: allow GitHub Actions to create PRs; enable auto-merge;
+#      branch protection on main with your required checks.
+#   4. Optional telemetry: pass telemetry-url / telemetry-api-key to install-claude.
+name: Auto-fix self-reported bugs
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  bug-fix:
+    # `status: in progress` guard: skip issues a human is already fixing in-session
+    if: "github.event.action == 'labeled' && github.event.label.name == 'bug' && !contains(github.event.issue.labels.*.name, 'status: in progress')"
+    runs-on: ubuntu-latest
+    concurrency:
+      group: bug-fix
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/install-claude
+
+      - name: Capture issue details
+        id: issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          echo "number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+          printf '%s' "${ISSUE_TITLE}" > /tmp/issue_title.txt
+          printf '%s' "${ISSUE_BODY}" > /tmp/issue_body.txt
+          gh issue view "${ISSUE_NUMBER}" \
+            --json comments \
+            --jq '.comments[] | .body' \
+            > /tmp/issue_comments.txt 2>/dev/null || true
+
+      - name: Write prompt file
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          cat > /tmp/prompt.txt << 'EOF'
+          A bug has been self-reported as a GitHub issue (no stack trace available).
+          EOF
+          {
+            echo "Issue #${ISSUE_NUMBER}: $(cat /tmp/issue_title.txt)"
+            echo ""
+            echo "Description:"
+            cat /tmp/issue_body.txt
+            echo ""
+            if [[ -s /tmp/issue_comments.txt ]]; then
+              echo "Additional context from comments:"
+              cat /tmp/issue_comments.txt
+              echo ""
+            fi
+          } >> /tmp/prompt.txt
+          cat >> /tmp/prompt.txt << 'EOF'
+          Start by using grep/search to find code relevant to the issue title and description — do NOT read files at random. Search for the specific component names, feature names, or terms mentioned in the issue, then read only the files that match.
+          Analyze the description, find the root cause in the codebase, and fix it.
+          Do NOT run any git commands — just edit the files.
+          Do NOT modify any files under .github/ — workflow changes are out of scope.
+          Do NOT add code comments explaining what you changed.
+
+          After making the fix, write two output files:
+
+          1. /tmp/summary.txt — a markdown summary with exactly these sections:
+          ## Problem
+          One or two sentences: what the bug was and how it manifested.
+          ## Root cause
+          One sentence: where in the code the issue lives.
+          ## Fix
+          Bullet list — one line per file changed, explaining what was changed and why.
+
+          2. /tmp/risk.txt — a single word: low or high.
+          Write "low" if ALL of the following are true:
+            - 1 or 2 files changed
+            - The fix is a null guard, type safety fix, or simple value correction
+            - No new functions, classes, or logic flows were added
+            - No auth, database schema, or API surface was touched
+          Write "high" for anything else, when in doubt use "high"
+
+          Write ONLY the word "low" or "high" to /tmp/risk.txt, nothing else.
+          EOF
+
+      - uses: ./.github/actions/check-existing-pr
+        id: pr_check
+        with:
+          branch-prefix: fix/issue-${{ steps.issue.outputs.number }}-
+
+      - uses: ./.github/actions/mark-in-progress
+        if: steps.pr_check.outputs.skip != 'true'
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+
+      - name: Run Claude Code
+        if: steps.pr_check.outputs.skip != 'true'
+        uses: ./.github/actions/run-claude
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          max-turns: '30'
+          extra-flags: '--dangerously-skip-permissions'
+
+      # Safeguard: even though the prompt forbids it, revert any .github/ edits
+      # so workflow modifications can never ride along in an auto-generated PR
+      - name: Revert .github/ changes
+        if: steps.pr_check.outputs.skip != 'true'
+        run: |
+          git fetch origin main
+          git checkout origin/main -- .github/ 2>/dev/null || true
+
+      - name: Check for code changes
+        id: changes
+        if: steps.pr_check.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          if [[ -z $(git diff --name-only) ]]; then
+            gh issue comment "${ISSUE_NUMBER}" \
+              --body "No code change was identified. To help the bot find the fix, please add more context: reproduction steps, which page or feature is affected, expected vs actual behavior, and any error messages you saw."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open fix PR
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: ./.github/actions/open-fix-pr
+        with:
+          issue-number: ${{ steps.issue.outputs.number }}
+          gh-pat: ${{ secrets.GH_PAT }}

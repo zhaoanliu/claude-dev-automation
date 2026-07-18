@@ -1,0 +1,38 @@
+name: Trigger CI auto-fix on failure
+description: >
+  Fire a repository_dispatch so a self-healing workflow can fix the failing
+  branch. Add as the last step of a CI workflow with `if: failure()`.
+  Uses `gh api` + jq, not actions/github-script — github-script requires a
+  github-token input and silently drops the dispatch when the secret is empty.
+
+inputs:
+  gh-pat:
+    description: 'PAT with repo scope — required so downstream pushes are attributed to a human actor and re-trigger CI'
+    required: true
+  event-type:
+    description: 'repository_dispatch event type the healing workflow listens for'
+    required: false
+    default: 'ci-failure'
+
+runs:
+  using: composite
+  steps:
+    - name: Dispatch failure event
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-pat }}
+        EVENT_TYPE: ${{ inputs.event-type }}
+        HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+      run: |
+        if [[ "${{ github.event.pull_request.draft }}" == "true" ]]; then
+          echo "Skipping ${EVENT_TYPE} dispatch: PR is a draft"
+          exit 0
+        fi
+        jq -n \
+          --arg et "$EVENT_TYPE" \
+          --arg wf "${{ github.workflow }}" \
+          --arg id "${{ github.run_id }}" \
+          --arg url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          --arg branch "$HEAD_BRANCH" \
+          '{"event_type":$et,"client_payload":{"workflow_name":$wf,"run_id":$id,"run_url":$url,"head_branch":$branch}}' \
+        | gh api repos/${{ github.repository }}/dispatches --method POST --input -
