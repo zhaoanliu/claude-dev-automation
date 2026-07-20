@@ -7,15 +7,14 @@
 # Setup:
 #   1. Get the composite actions. install-claude — recommended: replace
 #      `./.github/actions/install-claude` with
-#      `zhaoanliu/claude-dev-automation/actions/install-claude@v1.1.0` (exact
-#      tag). verify-ac must be VENDORED and adapted (see the
-#      feature-implement.yml header): copy it into .github/actions/verify-ac.
-#   2. Vendor claude-dev-automation/scripts/run-claude-retry.sh into
-#      .github/scripts/run-claude-retry.sh (verify-ac calls it there).
-#   3. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope — used for
+#      `zhaoanliu/claude-dev-automation/actions/install-claude@v2.0.0` (exact
+#      tag). verify-ac is consumed by pin since v2.0.0 — fill in its four
+#      project inputs at the `# ADAPT:` markers below (no vendoring; the
+#      pinned action brings run-claude-retry.sh with it).
+#   2. Secrets: ANTHROPIC_API_KEY, GH_PAT (PAT with repo scope — used for
 #      checkout so self-heal pushes are attributed to a human actor and
 #      re-trigger PR CI; GITHUB_TOKEN pushes are silently suppressed).
-#   4. Branch convention: PRs are found by the prefix `feat/issue-<N>-` —
+#   3. Branch convention: PRs are found by the prefix `feat/issue-<N>-` —
 #      this must match the branch naming in feature-implement.yml. If you
 #      change one, change both (`# ADAPT:` markers below).
 # See workflow-templates/FEATURE-PIPELINE.md for the full pipeline doc.
@@ -98,8 +97,8 @@ jobs:
         run: |
           git fetch origin "${PR_BRANCH}"
           git checkout "${PR_BRANCH}"
-          # Restore .github/ from main so the verify-ac composite action is always
-          # present, regardless of when the PR branch was cut.
+          # Restore .github/ from main so pipeline workflows and config are
+          # current regardless of when the PR branch was cut.
           git checkout origin/main -- .github/
 
       # ADAPT: toolchain setup and dependency install for your stack
@@ -117,10 +116,23 @@ jobs:
           git remote set-url origin "https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git"
 
       - name: Verify acceptance criteria
-        uses: ./.github/actions/verify-ac
+        uses: zhaoanliu/claude-dev-automation/actions/verify-ac@v2.0.0
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # ADAPT/OPTIONAL: local backing stack the app needs for E2E, e.g.:
+          # setup-commands: npx supabase start
+          # teardown-commands: npx supabase stop || true
+          # ADAPT: your project's E2E helper imports, auth flow, state
+          # restoration rules, and baseURL/webServer — one "- " rule per line.
+          spec-rules: |
+            - Import { createTestUser, deleteTestUser, loginViaUI } from './helpers'
+            - Use test.beforeAll to call createTestUser() and store userId; test.afterAll to call deleteTestUser(userId)
+            - Each test must: call loginViaUI(page), navigate to the relevant page, perform the described action, assert the outcome
+            - The app baseURL is http://localhost:3000 (Playwright webServer config starts npm run dev automatically)
+            - Read e2e/helpers.ts first to understand the available utilities
+          # ADAPT: your project's validation commands, one shell line
+          validation-commands: 'npm run lint && npx tsc --noEmit && npm run test:coverage'
 
       - name: Push self-heal commits if any
         run: |

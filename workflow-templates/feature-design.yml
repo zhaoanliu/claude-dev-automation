@@ -8,7 +8,7 @@
 # Setup:
 #   1. Get the composite actions (install-claude, run-claude) — recommended:
 #      replace each `./.github/actions/<name>` below with
-#      `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag; the
+#      `zhaoanliu/claude-dev-automation/actions/<name>@v2.0.0` (exact tag; the
 #      pinned run-claude brings its own copy of run-claude-retry.sh).
 #      Alternative: vendor them into .github/actions/ AND vendor
 #      claude-dev-automation/scripts/run-claude-retry.sh into

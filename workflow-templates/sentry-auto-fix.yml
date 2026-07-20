@@ -14,7 +14,7 @@
 # Setup:
 #   1. Get the composite actions — recommended: replace each
 #      `./.github/actions/<name>` below with
-#      `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag —
+#      `zhaoanliu/claude-dev-automation/actions/<name>@v2.0.0` (exact tag —
 #      never a floating `@v1` or `@main`). Alternative: vendor them from
 #      claude-dev-automation/actions/ into .github/actions/ (copy scripts/ to
 #      .github/scripts/ alongside).

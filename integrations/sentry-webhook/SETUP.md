@@ -18,7 +18,7 @@ End-to-end flow:
   get the composite actions (`install-claude`, `run-claude`,
   `check-existing-pr`, `mark-in-progress`, `open-fix-pr`) — recommended:
   replace each `./.github/actions/<name>` reference with
-  `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag);
+  `zhaoanliu/claude-dev-automation/actions/<name>@v2.0.0` (exact tag);
   alternative: vendor them from `actions/` into `.github/actions/`.
 - Adjust the `# ADAPT:` markers in the workflow (dependency install, local CI
   commands, project-specific prompt constraints).

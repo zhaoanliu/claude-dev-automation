@@ -12,7 +12,7 @@ This repo is shared by multiple projects and is **consumed by exact semver
 tag** — never by branch, never `@main`, never a floating major tag.
 
 - Consumers reference actions as
-  `uses: zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (the current
+  `uses: zhaoanliu/claude-dev-automation/actions/<name>@v2.0.0` (the current
   tag — see Releases).
 - Published tags are immutable — never moved or deleted. Fixes ship as a new
   tag (`v1.0.1`); breaking interface changes (renamed inputs, changed file
@@ -43,9 +43,12 @@ actions/             # composite actions — consume via pinned tag, or vendor i
   trigger-ci-failure/# repository_dispatch on CI failure (feeds ci-auto-fix)
   supabase-start/    # STACK MODULE (Supabase): supabase start with retries on transient failures
   verify-ac/         # generate + run acceptance-criteria E2E tests, self-heal on failure
-scripts/
-  run-claude-retry.sh    # canonical 529/overload retry loop (vendor to .github/scripts/)
-  check-ac-coverage.mjs  # CI gate: every AC item needs an [AC-N-N]-tagged passing test
+                     #   (project specifics — spec rules, validation, backing stack — are inputs)
+  check-ac-coverage/ # CI gate: every AC item needs an [AC-N-N]-tagged passing test
+scripts/             # travel with the tag — pinned actions resolve them relatively
+  run-claude-retry.sh    # canonical 529/overload retry loop (also exposed as
+                         #   install-claude's retry-script output for inline loops)
+  check-ac-coverage.mjs  # the script behind actions/check-ac-coverage
 workflow-templates/  # copy into .github/workflows/ and adapt the marked spots
   bug-fix.yml              # `bug`-labeled issue → Claude fix → risk-gated PR
   sentry-auto-fix.yml      # Sentry alert → issue → Claude fix → PR; resolves Sentry on close
@@ -73,10 +76,13 @@ playbook/            # process knowledge — copy and adapt
 ## Adopting in a new repo
 
 1. **Reference the actions by pinned tag** (recommended):
-   `uses: zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0`.
-   Vendoring into `.github/actions/` also works (copy `scripts/` to
-   `.github/scripts/` alongside — `run-claude` and `verify-ac` resolve the
-   retry script relatively and work in both layouts).
+   `uses: zhaoanliu/claude-dev-automation/actions/<name>@v2.0.0`. Nothing needs
+   vendoring — cross-repo composite actions check out this whole repo into the
+   action path, so `scripts/` travels with the tag (verify-ac and
+   check-ac-coverage resolve their scripts relatively; workflows with inline
+   Claude loops use `install-claude`'s `retry-script` output). Vendoring into
+   `.github/actions/` still works if you prefer it (copy `scripts/` to
+   `.github/scripts/` alongside).
 2. **Copy the workflow templates** you want into `.github/workflows/` and
    adapt the spots marked `# ADAPT:` in each file (labels, base branch,
    local-CI commands, deploy config). For the feature factory, read

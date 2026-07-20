@@ -5,7 +5,7 @@
 # Deliberately NOT covered:
 # - trigger-ci-failure: invoking it would fire a real repository_dispatch
 # - open-fix-pr: would create real branches/PRs
-# - verify-ac: vendor-and-adapt action; needs a consumer project's test stack
+# - verify-ac: needs a consumer project's app, test stack, and a real Claude run
 name: Test actions
 
 on:
@@ -79,6 +79,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./actions/install-claude
+        id: install
+
+      - name: Verify retry-script output points at the canonical retry loop
+        env:
+          RETRY_SCRIPT: ${{ steps.install.outputs.retry-script }}
+        run: |
+          [[ -n "$RETRY_SCRIPT" ]] || { echo "FAIL: retry-script output empty"; exit 1; }
+          [[ -f "$RETRY_SCRIPT" ]] || { echo "FAIL: $RETRY_SCRIPT does not exist"; exit 1; }
+          cmp -s "$RETRY_SCRIPT" scripts/run-claude-retry.sh \
+            || { echo "FAIL: output does not resolve to scripts/run-claude-retry.sh"; exit 1; }
+          echo "PASS: retry-script output resolves to the library script"
 
       - name: Verify claude is on PATH
         run: claude --version
@@ -208,6 +219,27 @@ jobs:
             status: backlog
             status: planned
 
+  test-check-ac-coverage:
+    # Dry-run: an empty pr-number takes the script's "No PR_NUMBER — skipping"
+    # exit-0 path, proving the composite resolves the script via
+    # GITHUB_ACTION_PATH and maps its env correctly. The full gating logic
+    # needs real PR/issue fixtures and is exercised in consumer repos.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./actions/check-ac-coverage
+        id: ac
+        with:
+          github-token: dummy-token-not-used-on-skip-path
+          pr-number: ''
+
+      - name: Assert the skip path succeeded without demanding results-file
+        env:
+          NEEDS_E2E: ${{ steps.ac.outputs.needs_e2e }}
+        run: |
+          [[ "$NEEDS_E2E" != "true" ]] || { echo "FAIL: needs_e2e set on skip path"; exit 1; }
+          echo "PASS: check-ac-coverage skip path works (needs_e2e='$NEEDS_E2E')"
+
   test-detect-doc-only:
     runs-on: ubuntu-latest
     steps:
@@ -238,7 +270,7 @@ jobs:
   # skipped check SATISFIES required status checks — silently disabling the gate.
   test-actions:
     if: always()
-    needs: [test-run-claude-retry, test-install-claude, test-check-existing-pr, test-mark-in-progress, test-detect-doc-only]
+    needs: [test-run-claude-retry, test-install-claude, test-check-existing-pr, test-mark-in-progress, test-detect-doc-only, test-check-ac-coverage]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any dependency failed
