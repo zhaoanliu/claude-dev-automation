@@ -6,14 +6,16 @@
 #   DESIGN_BODY   — full body of that design issue
 # Writes AC_PASS to $GITHUB_ENV: "true" | "false" | "skipped".
 #
-# Vendoring: copy this action to .github/actions/verify-ac/ in your repo AND
-# copy claude-dev-automation/scripts/run-claude-retry.sh to
-# .github/scripts/run-claude-retry.sh — the run_claude() wrapper below resolves
-# it via $GITHUB_ACTION_PATH/../../scripts/run-claude-retry.sh.
+# Consume by pin: `uses: <owner>/claude-dev-automation/actions/verify-ac@vX.Y.Z`.
+# Cross-repo composite actions get this whole repo checked out into the action
+# path, so the run_claude() wrapper below resolves
+# $GITHUB_ACTION_PATH/../../scripts/run-claude-retry.sh automatically. The same
+# relative path also works if you vendor this action into .github/actions/
+# (then vendor the script to .github/scripts/run-claude-retry.sh).
 #
-# `# ADAPT:` marks project-specific pieces: the optional local backing stack,
-# the Playwright test-generation rules (helper imports, baseURL, dev-server
-# command), and the post-self-heal validation commands.
+# Everything project-specific is an input: the optional local backing stack
+# (setup-commands / teardown-commands), the Playwright test-generation rules
+# (spec-rules), and the post-self-heal validation line (validation-commands).
 name: Verify acceptance criteria
 description: >
   Generate Playwright tests from the design issue's acceptance criteria,
@@ -22,12 +24,38 @@ description: >
   $GITHUB_ENV: "true" | "false" | "skipped".
 
 inputs:
-  github_token:
+  github-token:
     description: GitHub token for editing the design issue checkboxes
     required: true
-  anthropic_api_key:
+  anthropic-api-key:
     description: Anthropic API key for Claude
     required: true
+  spec-rules:
+    description: >
+      Project-specific rules appended to the Playwright test-generation
+      prompt: which helpers to import and from where, how tests sign in,
+      how state is set up and restored, the app baseURL and which Playwright
+      config/webServer serves it. One rule per line, each starting with "- ".
+    required: true
+  validation-commands:
+    description: >
+      One shell line of project validation commands (lint, typecheck, tests),
+      quoted in the self-heal prompt and executed best-effort after a heal —
+      the Playwright re-run is the actual gate.
+    required: true
+  setup-commands:
+    description: >
+      Optional shell commands starting the local backing stack the app needs
+      for E2E tests (database, auth, queue, ...). Run only when there are
+      acceptance criteria to verify. Pair with teardown-commands.
+    required: false
+    default: ''
+  teardown-commands:
+    description: >
+      Optional shell commands stopping the local backing stack. Always run
+      (even on failure) when there were acceptance criteria to verify.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -58,22 +86,10 @@ runs:
         cat /tmp/ac_text.txt
         echo "has_ac=true" >> "$GITHUB_OUTPUT"
 
-    # ── ADAPT/OPTIONAL: local backing stack ──────────────────────────────────
-    # If your app needs a local backend for E2E tests (database, auth, queue,
-    # ...), start it here — gated on has_ac so it only runs when there is
-    # something to verify — and stop it in the final always() step below.
-    # The source project started a local Supabase stack (with its well-known
-    # local demo keys) via a project-specific supabase-start composite action:
-    #
-    # - name: Install Supabase CLI
-    #   if: steps.ac_check.outputs.has_ac == 'true'
-    #   uses: supabase/setup-cli@v2.1.1
-    #   with:
-    #     version: 2.101.0
-    #
-    # - name: Start local Supabase
-    #   if: steps.ac_check.outputs.has_ac == 'true'
-    #   uses: ./.github/actions/supabase-start
+    - name: Start local backing stack
+      if: steps.ac_check.outputs.has_ac == 'true' && inputs.setup-commands != ''
+      shell: bash
+      run: ${{ inputs.setup-commands }}
 
     - name: Cache Playwright browsers
       id: playwright-cache
@@ -87,14 +103,11 @@ runs:
       if: steps.ac_check.outputs.has_ac == 'true'
       shell: bash
       env:
-        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
-        GITHUB_TOKEN: ${{ inputs.github_token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
         CI: "true"
-        # ADAPT/OPTIONAL: env vars pointing the app at the local backing stack.
-        # The source project used the well-known local Supabase demo keys:
-        # NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:54321
-        # NEXT_PUBLIC_SUPABASE_ANON_KEY: <local demo anon key>
-        # SUPABASE_SERVICE_ROLE_KEY: <local demo service-role key>
+        SPEC_RULES: ${{ inputs.spec-rules }}
+        VALIDATION_COMMANDS: ${{ inputs.validation-commands }}
         PLAYWRIGHT_CACHE_HIT: ${{ steps.playwright-cache.outputs.cache-hit }}
       run: |
         if [[ "${PLAYWRIGHT_CACHE_HIT}" == "true" ]]; then
@@ -112,18 +125,9 @@ runs:
           echo ""
           echo "RULES:"
           echo "- Import { test, expect } from '@playwright/test'"
-          # ADAPT: the next three rules describe the source project's E2E helper
-          # utilities (e2e/helpers.ts) and its login flow — replace with your
-          # project's test-user setup/teardown helpers and auth flow.
-          echo "- Import { createTestUser, deleteTestUser, loginViaUI } from './helpers'"
-          echo "- Use test.beforeAll to call createTestUser() and store userId; test.afterAll to call deleteTestUser(userId)"
+          printf '%s\n' "$SPEC_RULES"
           echo "- Write exactly one test() block per acceptance criterion, named with the criterion text"
-          echo "- Each test must: call loginViaUI(page), navigate to the relevant page, perform the described action, assert the outcome"
-          # ADAPT: baseURL and dev-server command from your Playwright webServer config
-          echo "- The app baseURL is http://localhost:3000 (Playwright webServer config starts npm run dev automatically)"
           echo "- Use page.locator(), page.getByRole(), page.getByText() — prefer accessible locators"
-          # ADAPT: point at your E2E helper file
-          echo "- Read e2e/helpers.ts first to understand the available utilities"
           echo "- Read relevant component and page files to understand actual HTML structure before writing selectors"
           echo "- Assert on visible text and user-facing behavior — not class names or implementation details"
           echo ""
@@ -188,19 +192,14 @@ runs:
               echo "=== Acceptance criteria (ground truth) ==="
               cat /tmp/ac_text.txt
               echo ""
-              # ADAPT: validation command list in the self-heal prompt — match
-              # your project's lint/typecheck/test commands
-              echo "After fixing, validate: npm run lint && npx tsc --noEmit && npm run test:coverage"
+              echo "After fixing, validate: ${VALIDATION_COMMANDS}"
               echo "Do not run any git commands."
             } > /tmp/ac_fix_prompt.txt
 
             run_claude /tmp/ac_fix_prompt.txt 25
 
-            # ADAPT: the same validation commands, run for real (best-effort —
-            # the Playwright re-run above is the actual gate)
-            npm run lint > /tmp/lint_out.txt 2>&1 || true
-            npx tsc --noEmit > /tmp/tsc_out.txt 2>&1 || true
-            npm run test:coverage > /tmp/test_out.txt 2>&1 || true
+            # Best-effort only — the Playwright re-run above is the actual gate.
+            bash -c "$VALIDATION_COMMANDS" > /tmp/validate_out.txt 2>&1 || true
 
             git add -A
             git restore --staged e2e/ac_verify.spec.ts 2>/dev/null || true
@@ -222,10 +221,7 @@ runs:
         # every verification run.
         rm -f e2e/ac_verify.spec.ts
 
-    # ── ADAPT/OPTIONAL: stop the local backing stack ─────────────────────────
-    # Pair with the startup section above. The source project's version:
-    #
-    # - name: Stop local Supabase
-    #   shell: bash
-    #   if: always() && steps.ac_check.outputs.has_ac == 'true'
-    #   run: supabase stop || true
+    - name: Stop local backing stack
+      if: always() && steps.ac_check.outputs.has_ac == 'true' && inputs.teardown-commands != ''
+      shell: bash
+      run: ${{ inputs.teardown-commands }}

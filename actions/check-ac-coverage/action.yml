@@ -1,0 +1,46 @@
+# Gate a PR on per-acceptance-criterion test coverage.
+#
+# Thin wrapper around scripts/check-ac-coverage.mjs, which resolves design
+# issues from the PR's "Closes #N" references, requires a passing test tagged
+# [AC-<design>-<n>] (from the vitest JSON results or an e2e/ spec file) for
+# every AC checklist item, ticks satisfied checkboxes on the design issue, and
+# emits needs_e2e=true when any criterion is covered only by an E2E tag.
+#
+# The consumer runs its unit suite with a JSON reporter first, e.g.:
+#   npx vitest run --reporter=json --outputFile=test-results.json
+name: Check AC coverage
+description: >
+  Fail the job unless every acceptance criterion on the PR's linked design
+  issues has a passing tagged test. No-op when the PR has no linked design
+  issues.
+
+inputs:
+  github-token:
+    description: Token with issues:write (ticks AC checkboxes on the design issue)
+    required: true
+  pr-number:
+    description: Pull request number to check
+    required: true
+  results-file:
+    description: Path to the unit-test JSON reporter output
+    required: false
+    default: 'test-results.json'
+
+outputs:
+  needs_e2e:
+    description: >
+      "true" when at least one acceptance criterion is covered only by an
+      E2E-tagged spec, so the caller should ensure the E2E suite runs.
+    value: ${{ steps.check.outputs.needs_e2e }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check AC coverage
+      id: check
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        RESULTS_FILE: ${{ inputs.results-file }}
+      run: node "$GITHUB_ACTION_PATH/../../scripts/check-ac-coverage.mjs"

@@ -13,8 +13,9 @@ Acceptance criteria stay enforced after the PR opens via a CI coverage gate.
 | `workflow-templates/feature-design.yml` | Phase 1 — generate design issue #Y from feature issue #X |
 | `workflow-templates/feature-implement.yml` | Phase 2 — implement #Y as subtasks, verify ACs, open PR |
 | `workflow-templates/feature-verify.yml` | Manual re-run of AC verification against an open feature PR |
-| `actions/verify-ac/action.yml` | Composite action: generate + run Playwright AC tests, 2-attempt self-heal |
-| `scripts/run-claude-retry.sh` | Canonical `claude -p` retry loop (529/overload backoff) — vendor to `.github/scripts/` |
+| `actions/verify-ac/action.yml` | Composite action: generate + run Playwright AC tests, 2-attempt self-heal — consumed by pin; project specifics are inputs |
+| `actions/check-ac-coverage/action.yml` | Composite action wrapping check-ac-coverage.mjs — consumed by pin |
+| `scripts/run-claude-retry.sh` | Canonical `claude -p` retry loop (529/overload backoff) — travels with the tag; inline loops reach it via install-claude's `retry-script` output |
 | `scripts/check-ac-coverage.mjs` | CI gate: every AC item must have a passing `[AC-N-N]`-tagged test |
 
 ## Label state machine
@@ -105,21 +106,19 @@ Rules:
   failure (max 2 attempts, strict-mode violations fix the test instead). The
   generated spec is deleted afterwards — it is never committed.
 
-## Wiring check-ac-coverage.mjs into CI
+## Wiring check-ac-coverage into CI
 
-Run it on every PR after the unit-test suite, with a JSON reporter output.
-Snippet from the source project's `test.yml`:
+Run it on every PR after the unit-test suite, with a JSON reporter output:
 
 ```yaml
       - run: npx vitest run --reporter=json --outputFile=test-results.json
 
       - name: Check AC coverage
         id: ac_check
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: node scripts/check-ac-coverage.mjs
+        uses: zhaoanliu/claude-dev-automation/actions/check-ac-coverage@v2.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ github.event.pull_request.number }}
 ```
 
 The job needs `permissions: issues: write` (it checks off passing AC items in
@@ -158,26 +157,26 @@ The job needs `permissions: issues: write` (it checks off passing AC items in
 2. Get the composite actions. `install-claude`, `run-claude`,
    `check-existing-pr`, `mark-in-progress` — recommended: replace each
    `./.github/actions/<name>` reference with
-   `zhaoanliu/claude-dev-automation/actions/<name>@v1.1.0` (exact tag);
-   alternative: vendor into `.github/actions/`. `verify-ac` must be
-   **vendored and adapted** regardless — it encodes your project's test
-   environment (helpers contract, base URL, validation commands).
-3. Vendor `scripts/run-claude-retry.sh` into
-   `.github/scripts/run-claude-retry.sh` (keep it executable) — the
-   `run_claude()` wrappers in feature-implement.yml and verify-ac call it there.
-4. Copy `scripts/check-ac-coverage.mjs` into `scripts/` and wire it into your
-   PR test workflow (snippet above).
-5. Work through every `# ADAPT:` marker: dependency install, lint/typecheck/
+   `zhaoanliu/claude-dev-automation/actions/<name>@v2.0.0` (exact tag);
+   alternative: vendor into `.github/actions/` (then also vendor `scripts/`
+   to `.github/scripts/`). `verify-ac` and `check-ac-coverage` are consumed
+   by pin — since v2.0.0 everything project-specific about verify-ac
+   (spec-rules, validation-commands, optional setup/teardown-commands) is an
+   input filled in at the templates' `# ADAPT:` markers; nothing needs
+   vendoring, and `scripts/` travels with the tag.
+3. Wire `check-ac-coverage` into your PR test workflow (snippet above).
+4. Work through every `# ADAPT:` marker: dependency install, lint/typecheck/
    test commands, test-directory conventions (`__tests__/`, `e2e/`), the
-   Playwright helper rules and baseURL in verify-ac, the optional local
-   backing stack, and the design prompt's domain-specific research guidance.
-6. Create labels: `status: approved`, `status: design-review`,
+   verify-ac inputs (Playwright helper rules, baseURL, validation commands,
+   optional local backing stack), and the design prompt's domain-specific
+   research guidance.
+5. Create labels: `status: approved`, `status: design-review`,
    `status: auto-implement`, `status: in progress`, `status: planned`,
    `status: backlog`, `implementation`, `user review required`,
    `manual merge required`, `needs-acceptance-testing`.
-7. Secrets: `ANTHROPIC_API_KEY`, `GH_PAT`.
-8. Repo settings: allow GitHub Actions to create pull requests; branch
+6. Secrets: `ANTHROPIC_API_KEY`, `GH_PAT`.
+7. Repo settings: allow GitHub Actions to create pull requests; branch
    protection on `main` with your required checks (include the AC coverage
    job).
-9. Dry-run: open a small feature issue, add `status: approved`, review the
+8. Dry-run: open a small feature issue, add `status: approved`, review the
    generated #Y, then add `status: auto-implement` and watch the PR appear.

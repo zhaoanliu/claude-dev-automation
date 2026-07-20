@@ -23,7 +23,7 @@ Never hardcode local absolute paths in committed files.
 
 ## Versioning and releases
 
-- Consumers pin **exact, immutable tags**: `@v1.1.0`. Never move or delete a
+- Consumers pin **exact, immutable tags**: `@v2.0.0`. Never move or delete a
   published tag. Never tell a consumer to reference `@main`.
 - Fixes → patch tag; new assets → minor tag; interface changes (renamed
   inputs, changed file contracts like `/tmp/risk.txt`, changed
@@ -32,7 +32,7 @@ Never hardcode local absolute paths in committed files.
   tag → `gh release create vX.Y.Z` with notes stating whether it is a drop-in
   upgrade. Every tag must trace to a merged PR and its issue.
 - **When cutting a tag, update the current-tag references in docs** — grep
-  for the previous tag (`grep -rn 'v1\.1\.0' --include='*.md' --include='*.yml' .`)
+  for the previous tag (`grep -rn 'v2\.0\.0' --include='*.md' --include='*.yml' .`)
   and bump README, template headers, SETUP.md, and FEATURE-PIPELINE.md in the
   release PR itself.
 - Consumers upgrade deliberately: bump the pin in *their* repo (grep for
@@ -44,10 +44,12 @@ Never hardcode local absolute paths in committed files.
   consumer-project names in code paths, personal directory structure, or
   project-internal details. Consumer-specific behavior goes through action
   inputs or `# ADAPT:` markers in templates — never hardcoded.
-- **Actions version by tag; templates version by copy.** Actions must keep
-  small, stable input surfaces. If making something reusable would require a
-  dozen inputs or a prose-prompt parameter, ship it as a vendor-and-adapt
-  template (like `verify-ac`) instead of a pinned action.
+- **Actions version by tag; templates version by copy.** Actions keep small,
+  stable input surfaces; project-specific behavior goes through a handful of
+  well-named inputs (`verify-ac`'s spec-rules / validation-commands /
+  setup-commands are the pattern — since v2.0.0 it is consumed by pin, not
+  vendored). Only full workflows — whose embedded prompts and job wiring
+  differ per consumer — ship as vendor-and-adapt templates.
 - Stack-specific assets (Supabase, Vercel, Sentry) are welcome but must be
   clearly labeled in the README's "Stack modules" section. The core stays
   stack-agnostic.
@@ -67,10 +69,11 @@ Two CI workflows run on every PR, and both are required checks:
   on `.mjs` scripts.
 - `test-actions.yml` — behavioral: stub-based tests of run-claude (retry
   backoff, script resolution via `GITHUB_ACTION_PATH`), install-claude
-  (wrapper, model default/override, telemetry), check-existing-pr,
-  mark-in-progress, and detect-doc-only. No API key is spent — `claude` is
-  stubbed. trigger-ci-failure, open-fix-pr, and verify-ac are deliberately
-  untested here (real side effects / consumer environment required).
+  (wrapper, model default/override, telemetry, retry-script output),
+  check-existing-pr, mark-in-progress, detect-doc-only, and
+  check-ac-coverage (skip path). No API key is spent — `claude` is stubbed.
+  trigger-ci-failure, open-fix-pr, and verify-ac are deliberately untested
+  here (real side effects / consumer environment required).
 
 Run the static checks locally before pushing:
 
